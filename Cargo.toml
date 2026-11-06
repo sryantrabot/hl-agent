@@ -1,0 +1,31 @@
+[workspace]
+
+[package]
+name = "hl-agent"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Guardrailed Hyperliquid kit for AI agents: stdio MCP server with read-only market tools + a dry-run order simulator behind guardrail caps. Never touches live keys; never places real orders."
+
+[[bin]]
+name = "hl-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# reqwest 0.13: JSON + rustls (no OpenSSL in
+# the slim image), blocking client only — the stdio loop is single-threaded.
+reqwest = { version = "0.13", default-features = false, features = ["json", "blocking", "rustls"] }
+# The real guardrail engine (pure, no network/keys) lives in the bundled
+# guardrail crate; src/guardrail.rs is a re-export shim keeping existing paths working.
+guardrail = { path = "guardrail" }
+# Optional signed path: local ECDSA signing only —
+# the key NEVER leaves memory and is never read from .env or disk. Versions pinned to
+# what Cargo.lock already resolves (alloy-signer 2.5.0, alloy-primitives 1.7.3).
+alloy-primitives = { version = "1.7", default-features = false, features = ["std", "k256"] }
+alloy-signer = { version = "2.5", default-features = false }
+alloy-signer-local = { version = "2.5", default-features = false }
+

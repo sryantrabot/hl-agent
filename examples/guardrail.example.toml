@@ -1,0 +1,12 @@
+# hl-agent guardrail config (dry-run simulator). All fields required.
+# The simulator NEVER places real orders; these caps decide what it allows
+# so an agent's strategy can be rehearsed before it ever touches money.
+
+max_position_notional_usd = 5000.0   # max |position| per coin, USD notional
+max_order_notional_usd    = 500.0    # max single order, USD notional
+max_leverage              = 2.0      # order notional <= this x account_equity_usd
+account_equity_usd        = 2500.0   # assumed equity (simulator is keyless and cannot read it)
+daily_loss_cap_usd        = 50.0     # stop for the UTC day when realized PnL <= -this
+max_similar_actions       = 3        # loop tripwire: >= this near-identical orders in the window => reject
+loop_window_seconds       = 60       # tripwire window
+max_calls_per_hour        = 20       # max order intents per rolling hour
