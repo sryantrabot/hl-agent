@@ -107,8 +107,8 @@ so the agent can correct itself instead of retrying blind.
 
 ## Builder fee (what changes in week 2)
 
-Orders you approve carry our builder address (0x5a229a20D9636a07583D6868FABf4B2903271Ab7)
-with a per-trade fee of 2–5 bp, paid to the kit maintainer, capped at approval time and
+Orders you approve will carry our builder code: `builder: {b: <address>, f: <fee in tenths
+of bp>}` — a 2–5 bp per-trade fee paid to the kit maintainer, capped at approval time and
 revocable by you. Mechanics (verified from Hyperliquid docs, 2026-11-04):
 
 - You approve **once** from your main wallet via `ApproveBuilderFee` with a max-fee cap;
@@ -117,15 +117,14 @@ revocable by you. Mechanics (verified from Hyperliquid docs, 2026-11-04):
 - Agent (API) wallets sign orders only — no withdrawals, no approvals.
 - Fee evidence is public: daily per-builder fill CSVs on Hyperliquid's stats host.
 
-This release includes the local signer and the builder-code attachment; example
-configs for common agent hosts are in the quickstart above.
-
+Week 2 adds the local signer + builder-code attachment; week 3 ships example configs for
+common agent hosts. Spec of record: `specs/hl-agent.md`.
 
 ## License
 
 MIT.
 
-## Wiring your agent key (the optional signed path)
+## Week 2: wire your agent key (specs/hl-agent.md §Week 2)
 
 The kit now has an OPTIONAL signed path (`hl_agent::signer::AgentSigner` +
 `hl_agent::exchange::ExchangeClient`). The dry-run `DryRunSimulator` remains the
@@ -149,5 +148,26 @@ DEFAULT — nothing in the MCP server or the binary signs or places an order.
 - **Signature construction is VERIFIED against the official SDKs’ pinned vectors**
   (hyperliquid-rust-sdk + hyperliquid-python-sdk, fetched live 2026-11-05; the
   two SDK exchange_client test vectors + the create_signature EIP-712 vector pass
-  byte-exactly (27/27 `cargo test -p hl-agent --lib`)).
+  byte-exactly — 30/30 `cargo test -p hl-agent --lib` (includes the approveBuilderFee shape + end-to-end sign-and-recover tests), see specs/hl-agent.md Week 2).
   Mainnet use still requires explicit operator opt-in.
+
+## Approving the builder fee (your one signature)
+
+Every order our code sends on your behalf carries our builder address, so a small
+fee (we default to 2 bp, hard-capped at 10 bp in the kit) lands with the builder
+when your order fills. Before any of that works, your **main** wallet approves the
+fee once — an API/agent wallet cannot (the venue rejects it by design), and you can
+revoke it at any time from your account.
+
+```sh
+# TESTNET (default; safe to run with a throwaway key):
+cargo run -p hl-agent --example approve_builder_fee -- <main-wallet-key> \
+    0x5a229a20D9636a07583D6868FABf4B2903271Ab7 20
+
+# MAINNET: same command plus --mainnet, and HL_ALLOW_MAINNET set in your environment.
+```
+
+The example signs the one `approveBuilderFee` action, then checks it landed by
+querying `maxBuilderFee(your_address, builder)` — it prints the approved cap when
+the check passes. No other signature from you is ever needed, and placing orders
+without the approval simply fails on the venue side.

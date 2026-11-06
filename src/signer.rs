@@ -1,8 +1,9 @@
-//! Agent signer: turns a Hyperliquid API-wallet
+//! Agent signer (week 2, specs/hl-agent.md §Week 2): turns a Hyperliquid API-wallet
 //! private key into signatures over exchange (L1) action envelopes. The key lives ONLY
 //! in process memory — never read from .env or disk, never logged.
 //!
-//! VERIFIED-CONSTRUCTION 2026-11-05: byte-level construction fetched live from the\n//! official SDKs —
+//! VERIFIED-CONSTRUCTION 2026-11-05 (ceo/product run #131; supersedes the run-128
+//! run-128 best-spec pin): fetched live from the official SDKs —
 //!   - hyperliquid-dex/hyperliquid-rust-sdk @ master:
 //!       src/exchange/exchange_client.rs  `Actions::hash`  (msgpack + nonce + vault flag)
 //!       src/signature/agent.rs           `l1::Agent`      (EIP-712 domain + struct)
@@ -561,4 +562,46 @@ mod tests {
     }
 
 
+}
+
+// ---------- ApproveBuilderFee (the one-time, revocable main-wallet approval) ----------
+// Wire truth (knowledge/intel/2026-11-05-agent-pain/hl-builder-codes.md, docs verified
+// live 2026-11-04): the approval is an EXCHANGE L1 action {"type":"approveBuilderFee",
+// "maxFeeRate": "<f> tenths of bp as a decimal string", "builder": "0x…"}, signed by the
+// USER'S MAIN WALLET — an API/agent wallet CANNOT approve (sign-only by design). One
+// approval per builder, max 10 active per user, revocable any time. `maxFeeRate` mirrors
+// the SDK's ApproveBuilderFee declaration: a decimal STRING like "0.02%" (2 bp of the
+// quote-asset fee). We always emit the exact-percent string form; f tenths-of-bp must be
+// a multiple of 10 or the percent has a fractional part the venue parses as a float —
+// both forms are legal on the wire, we pick integer tenths to keep the msgpack
+// byte-exact with the pinned SDK encoding (strings, declaration order).
+
+/// msgpack for the approveBuilderFee action — rmp_serde::to_vec_named shape for the
+/// SDK's Actions::ApproveBuilderFee(ApproveBuilderFee{max_fee_rate, builder}):
+/// {"type":"approveBuilderFee","maxFeeRate":<str>,"builder":<str>} in declaration order.
+pub fn approve_builder_fee_action_msgpack(builder_addr: &str, fee_tenths_bp: u32) -> Result<Vec<u8>> {
+    validate_builder_address(builder_addr)?;
+    if fee_tenths_bp == 0 || fee_tenths_bp > 100 {
+        bail!(
+            "builder fee {fee_tenths_bp} must be 1..=100 tenths of bp (this kit caps at the venue perp limit 10 bp)"
+        );
+    }
+    let max_fee_rate = format!("{}%", fee_tenths_bp as f64 / 1000.0);
+    let mut buf = Vec::with_capacity(96);
+    mp_map_header(&mut buf, 3)?; // type, maxFeeRate, builder (declaration order)
+    mp_str(&mut buf, "type");
+    mp_str(&mut buf, "approveBuilderFee");
+    mp_str(&mut buf, "maxFeeRate");
+    mp_str(&mut buf, &max_fee_rate);
+    mp_str(&mut buf, "builder");
+    mp_str(&mut buf, &builder_addr.trim().to_ascii_lowercase());
+    Ok(buf)
+}
+
+pub fn validate_builder_address(builder_addr: &str) -> Result<()> {
+    let b = builder_addr.trim().to_ascii_lowercase();
+    if !b.starts_with("0x") || b.len() != 42 || !b[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("builder address must be a 0x-prefixed 20-byte hex address, got {builder_addr:?}");
+    }
+    Ok(())
 }
