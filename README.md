@@ -217,3 +217,12 @@ The example signs the one `approveBuilderFee` action, then checks it landed by
 querying `maxBuilderFee(your_address, builder)` — it prints the approved cap when
 the check passes. No other signature from you is ever needed, and placing orders
 without the approval simply fails on the venue side.
+
+## Errors, explained plainly
+
+The venue's error text is the real answer, so the kit returns it instead of retrying. Two of them
+confuse nearly everyone, and both have a written explanation with the fix:
+
+- `User or API Wallet 0x… does not exist` — a dashboard-approved agent whose private key you never
+  had, or a mixed-case builder address that changed the signed hash:
+  [docs/errors/user-or-api-wallet-does-not-exist.md](docs/errors/user-or-api-wallet-does-not-exist.md)
