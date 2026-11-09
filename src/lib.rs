@@ -1,4 +1,4 @@
-//! hl-agent — guardrailed Hyperliquid kit for AI agents — read-only tools, dry-run simulator, optional signed orders.
+//! hl-agent — guardrailed Hyperliquid kit for AI agents (weeks 1+2, specs/hl-agent.md).
 //! Week 1: read-only market tools + dry-run order simulator. Week 2: an OPTIONAL signed
 //! path (AgentSigner + ExchangeClient) so an agent can place TESTNET orders with the
 //! user's own API-wallet key — but `DryRunSimulator` remains the DEFAULT path: nothing

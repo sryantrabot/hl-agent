@@ -163,7 +163,12 @@ impl Guardrail {
                     }
                 }
             };
-            let is_reduce = intent.reduce_only || (pos > 0.0 && !intent.is_buy);
+            // A sell only REDUCES when it does not flip the position. Treating every sell on a
+            // long as a reduce (as this used to) let a sell 10x the position open a huge
+            // short with the position cap switched off. A flip is judged by its size, so
+            // the |position after| branch below is what has to run.
+            let reducing = pos > 0.0 && !intent.is_buy && intent.size * mark <= pos + 1e-9;
+            let is_reduce = intent.reduce_only || reducing;
             if !is_reduce {
                 let worst = if intent.is_buy { pos + intent.size * mark } else { (pos - intent.size * mark).abs() };
                 if worst > self.cfg.max_position_notional_usd + 1e-9 {

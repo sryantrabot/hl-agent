@@ -1,6 +1,7 @@
-//! Exchange client (the optional signed path): the OPTIONAL signed path.
+//! Exchange client: the OPTIONAL signed path.
 //! POSTs ONE signed action to `{base}/exchange` and parses the venue's
 //! `{status:"ok"}` / `{status:"err", response:<text>}` envelope. NO retry loop —
+//! Hyperliquid's nonce window makes blind replays dangerous (see knowledge/intel/
 //! 2026-11-05-agent-pain/hl-builder-codes.md: one API wallet per process, T-2d..T+1d).
 //!
 //! SAFETY LAWS (dispatch): no live keys in this repo, no mainnet POSTs from tests,
@@ -43,7 +44,8 @@ impl OrderWire {
     }
 }
 
-/// Docs-faithful builder-fee validation : f is tenths of bp; caps 10 bp (f<=100) enforced conservatively
+/// Docs-faithful builder-fee validation (knowledge/intel/2026-11-05-agent-pain/
+/// hl-builder-codes.md): f is tenths of bp; caps 10 bp (f<=100) enforced conservatively
 /// for perps AND spot; builder codes "do not apply to the buying side of spot trades".
 pub fn validate_builder_fee(fee_tenths_bp: u32, order: &OrderWire) -> Result<()> {
     if fee_tenths_bp > 100 {
@@ -123,6 +125,12 @@ impl ExchangeClient {
     /// TESTNET by default (dispatch law: testnet first).
     pub fn testnet(signer: AgentSigner) -> Self {
         Self::new(TESTNET, signer)
+    }
+
+    /// The signer's public address, so the live path can prove the `--user` account it
+    /// reads caps from is really the account this key may trade for. Never the key.
+    pub fn signer_address(&self) -> String {
+        format!("{:#x}", self.signer.address())
     }
 
     /// Build the wire envelope {action, nonce, signature} — pure, so tests can

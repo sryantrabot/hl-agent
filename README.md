@@ -1,9 +1,15 @@
-# hl-agent — guardrailed Hyperliquid kit for AI agents (week 1)
+# hl-agent — guardrailed Hyperliquid kit for AI agents (v0.2.0)
 
-A Rust **MCP server** that gives your AI agent read-only Hyperliquid market tools and a
-**dry-run order simulator** behind hard guardrail caps. Week 1 places **no real orders and
-uses no keys** — it exists so you can rehearse an agent's trading behavior safely before
-wiring a real (sign-only) agent key in week 2.
+A Rust **MCP server** that gives your AI agent Hyperliquid market tools, a **dry-run order
+simulator** behind hard guardrail caps, and an OPTIONAL **live-order path**: your own
+sign-only agent key signs a real order, but only after every cap passes. **The default is
+dry-run: no key, no order.** Real orders need `--live`, your key in `HL_AGENT_KEY`, and a
+guardrail file you wrote.
+
+These are leveraged perps. You can lose money, and testnet behaviour does not predict
+mainnet. The kit is MIT-licensed with no warranty: the caps you write and the agent you point
+at it are yours to own. Rate-limit and tripwire state live in the process and reset when it
+restarts.
 
 ## Install & run
 
@@ -101,12 +107,15 @@ so the agent can correct itself instead of retrying blind.
 
 ## Safety model
 
-- **Week 1 never signs, never sends orders, never holds keys.** The only network calls are
-  Hyperliquid's public `/info` endpoints (read-only market data).
+- **The default is dry-run: no key, no order, no signature code.** Without `--live` the
+  process never reads a key and every network call is a public `/info` read.
 - The simulator mutates only its own in-memory book. Nothing is persisted, nothing is sent.
-- Your future **agent key never leaves your machine**: in week 2 you run the signer locally
-  (Hyperliquid API wallets are sign-only — they cannot withdraw or approve). This server
-  still won't see the key; the signer runs as a separate local process.
+- **Your agent key never leaves your machine.** It is a Hyperliquid API wallet: sign-only,
+  it cannot withdraw or approve. It is read from `HL_AGENT_KEY` only — never a flag, never a
+  file, never `.env` — and its Debug output is redacted to the public address.
+- **Before arming, the kit proves the key may trade for the `--user` account** (your address,
+  or an entry in that account's `extraAgents`). A wrong `--user` would otherwise leave the
+  position and daily-loss caps reading an empty account.
 
 ## Builder fee (what changes in week 2)
 
@@ -121,7 +130,7 @@ revocable by you. Mechanics (verified from Hyperliquid docs, 2026-11-04):
 - Fee evidence is public: daily per-builder fill CSVs on Hyperliquid's stats host.
 
 Week 2 adds the local signer + builder-code attachment; week 3 ships example configs for
-common agent hosts. The signed-order section is below.
+common agent hosts.
 
 ## License
 
@@ -131,7 +140,8 @@ MIT.
 
 The kit now has an OPTIONAL signed path (`hl_agent::signer::AgentSigner` +
 `hl_agent::exchange::ExchangeClient`). The dry-run `DryRunSimulator` remains the
-DEFAULT — nothing in the MCP server or the binary signs or places an order.
+DEFAULT — nothing signs or places an order unless you start the server with `--live`,
+and then only after every cap in your TOML passes.
 
 - **API wallet, not your main key.** Create a Hyperliquid API wallet and approve it to
   act for your master account. API wallets are **sign-only**: they can sign orders but
@@ -151,7 +161,7 @@ DEFAULT — nothing in the MCP server or the binary signs or places an order.
 - **Signature construction is VERIFIED against the official SDKs’ pinned vectors**
   (hyperliquid-rust-sdk + hyperliquid-python-sdk, fetched live 2026-11-05; the
   two SDK exchange_client test vectors + the create_signature EIP-712 vector pass
-  byte-exactly — 30/30 `cargo test -p hl-agent --lib` (includes the approveBuilderFee shape + end-to-end sign-and-recover tests), see the signed-order section of this README).
+  byte-exactly — 30/30 `cargo test -p hl-agent --lib` (includes the approveBuilderFee shape + end-to-end sign-and-recover tests), see the signed-order section above).
   Mainnet use still requires explicit operator opt-in.
 
 ## Placing real orders (`--live`)
@@ -171,9 +181,9 @@ The dry-run simulator stays the default. Real orders need three things and nothi
 export HL_AGENT_KEY=0x...            # your API wallet key (sign-only)
 cargo run -p hl-agent -- --live --testnet --user 0xYourMainWallet \
     --config examples/guardrail.example.toml
-
-# mainnet, only after the testnet run behaved: same command plus --mainnet
-# and HL_ALLOW_MAINNET=1 in your environment.
+# mainnet, only after the testnet run behaved: DROP --testnet and set HL_ALLOW_MAINNET=1.
+# There is no --mainnet flag on the server: mainnet is the default base URL, gated by that
+# env var so it cannot happen by accident.
 ```
 
 Start with the smallest size your venue allows (Hyperliquid's minimum order value is $10). The
@@ -205,24 +215,24 @@ fee once — an API/agent wallet cannot (the venue rejects it by design), and yo
 revoke it at any time from your account.
 
 ```sh
-# TESTNET (default; safe to run with a throwaway key). The key is read from
-# HL_MAIN_KEY, never from the command line.
-HL_MAIN_KEY=0x... cargo run -p hl-agent --example approve_builder_fee -- \
+# The main wallet key controls ALL funds in that account and can withdraw. It is not the
+# sign-only agent key, and it must not be typed on a command line (argv lands in your shell
+# history and in the process list). Read it into the environment without echoing it:
+read -rs HL_MAIN_KEY && export HL_MAIN_KEY
+
+# TESTNET first (safe to rehearse with a throwaway main wallet):
+cargo run -p hl-agent --example approve_builder_fee -- \
     0x5a229a20D9636a07583D6868FABf4B2903271Ab7 20
 
-# MAINNET: same command plus --mainnet, and HL_ALLOW_MAINNET set in your environment.
+# MAINNET (the example DOES take --mainnet): add --mainnet after the fee and set
+# HL_ALLOW_MAINNET so the opt-in is deliberate.
 ```
+
+You approve once and can revoke it in the Hyperliquid UI at any time. If you would rather not
+handle the key at all, approve the builder in the Hyperliquid UI instead — the kit reads the
+approval from the venue either way.
 
 The example signs the one `approveBuilderFee` action, then checks it landed by
 querying `maxBuilderFee(your_address, builder)` — it prints the approved cap when
 the check passes. No other signature from you is ever needed, and placing orders
 without the approval simply fails on the venue side.
-
-## Errors, explained plainly
-
-The venue's error text is the real answer, so the kit returns it instead of retrying. Two of them
-confuse nearly everyone, and both have a written explanation with the fix:
-
-- `User or API Wallet 0x… does not exist` — a dashboard-approved agent whose private key you never
-  had, or a mixed-case builder address that changed the signed hash:
-  [docs/errors/user-or-api-wallet-does-not-exist.md](docs/errors/user-or-api-wallet-does-not-exist.md)

@@ -1,7 +1,7 @@
 //! Dry-run order simulator: intent -> guardrail gate -> simulated fill.
 //! NO network order placement, NO keys, NO signing — the simulator only mutates its own
 //! in-memory book. The fill-check step sits behind a trait so tech's real engine
-//! (crates/guardrail, this README Week 1 tech) can drop in without touching callers.
+//! (crates/guardrail, specs/hl-agent.md Week 1 tech) can drop in without touching callers.
 use crate::guardrail::{Ctx, Decision, Guardrail, OrderIntent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ impl FillCheck for AlwaysFillStub {
     }
 }
 
-/// Week-2 deterministic OFFLINE fill-check (the signed-order section of this README; the engine's
+/// Week-2 deterministic OFFLINE fill-check (specs/hl-agent.md §Week 2; the engine's
 /// venue classifier lives in crates/guardrail/src/fill.rs and needs a venue response —
 /// this stub runs with no network and no venue at all):
 /// - market order with a mark, or a limit order CROSSING the mark (buy limit >= mark,

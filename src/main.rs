@@ -65,6 +65,11 @@ fn main() {
             Err(e) => die(&e),
         },
         None => {
+            if live {
+                // The live path signs real orders. Arming it on caps the user never wrote
+                // down (built-in defaults) is not a default, it is a surprise: require the file.
+                die("--live needs --config <guardrail.toml>: the caps that run before every signature must be the ones you wrote, not built-in defaults. examples/guardrail.example.toml is a starting point.");
+            }
             eprintln!("hl-agent: no --config given: read-only market tools only (simulate_order disabled)");
             hl_agent::guardrail::GuardrailConfig::from_toml_str(defaults_toml()).expect("built-in defaults parse")
         }
@@ -140,12 +145,30 @@ fn build_live(
     let builder = builder
         .or_else(|| std::env::var("HL_BUILDER_ADDRESS").ok())
         .or_else(|| Some(DEFAULT_BUILDER.to_string()));
-
     let is_mainnet = base_url == MAINNET;
     if is_mainnet && std::env::var("HL_ALLOW_MAINNET").is_err() {
         die("mainnet orders need HL_ALLOW_MAINNET set in the environment. Start on --testnet with a throwaway key.");
     }
+    // PROVE the account before arming: the signed action carries no user field, so the
+    // venue cannot catch a wrong --user. A wrong one (a typo, the API wallet's own
+    // address, a subaccount) returns a well-formed EMPTY account, which would leave the
+    // position and daily-loss caps reading zero while orders still execute on the master.
+    // So: the signer's own address OR an entry in the main wallet's extraAgents, or exit.
     let ex = hl_agent::ExchangeClient::new(base_url, signer);
+    let signer_addr = ex.signer_address().to_ascii_lowercase();
+    let user_lc = user.to_ascii_lowercase();
+    if signer_addr != user_lc {
+        let hl_check = HlClient::new(base_url);
+        match hl_check.extra_agents(&user) {
+            Ok(agents) if agents.iter().any(|a| a.eq_ignore_ascii_case(&signer_addr)) => {}
+            Ok(_) => die(&format!(
+                "--user {user} does not list this key's address {signer_addr} in its extraAgents, so the key may not trade for that account and the guardrail caps would read the wrong one. Approve the API wallet at app.hyperliquid.xyz/API for that main wallet, then retry."
+            )),
+            Err(e) => die(&format!(
+                "could not read extraAgents for --user {user} ({e}), so the kit cannot prove this key may trade for it — refusing to arm rather than read caps from the wrong account"
+            )),
+        }
+    }
     let venue = hl_agent::HlVenue { hl: HlClient::new(base_url), ex };
     let live_cfg = hl_agent::LiveConfig {
         user,

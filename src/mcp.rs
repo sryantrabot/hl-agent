@@ -160,7 +160,7 @@ impl Server {
                     .unwrap_or(0);
                 let mark = match (mark_override, limit_price) {
                     (Some(m), _) => Some(m),
-                    (None, Some(_)) => None, // limit: no mark needed for the fill, gate still price-checks via limit
+                    (None, Some(px)) => Some(px), // a limit order must still be priced for the gate
                     (None, None) => Some(self.hl.mid_of(&intent.coin).map_err(|e| e.to_string())?),
                 };
                 let res = sim.execute(&intent, mark, now_ms);
@@ -462,6 +462,20 @@ mod tests {
         let resp = s.handle_line(line).unwrap();
         let sc = &resp["result"]["structuredContent"];
         assert_eq!(sc["guardrail_decision"]["status"], "reject");
+        assert!(sc["guardrail_decision"]["reason"].as_str().unwrap().contains("cap"));
+    }
+
+    #[test]
+    fn simulate_limit_order_is_still_priced_so_the_usd_caps_run() {
+        // Regression (critic round 3, 2026-11-09): a limit order used to pass mark=None to
+        // the gate, which skips every USD cap, so 100 BTC @ 80_000 against a 500 USD cap
+        // came back "allow". The limit price is now the price source.
+        let mut s = server_with_sim();
+        let line = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"simulate_order","arguments":{"coin":"BTC","side":"buy","size":100.0,"limit_price":80000.0}}}"#;
+        let resp = s.handle_line(line).unwrap();
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["dry_run"], true);
+        assert_eq!(sc["guardrail_decision"]["status"], "reject", "a limit order must be priced for the caps: {sc}");
         assert!(sc["guardrail_decision"]["reason"].as_str().unwrap().contains("cap"));
     }
 

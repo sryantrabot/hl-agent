@@ -1,4 +1,4 @@
-//! guardrail engine acceptance tests (this README Week 1 tech).
+//! guardrail engine acceptance tests (CEO r178, specs/hl-agent.md Week 1 tech).
 //! Everything runs through the PUBLIC API only: config TOML, allow() gate,
 //! fill classification, idempotency book, retry helper.
 use guardrail::{
@@ -515,4 +515,20 @@ fn decision_serializes_stable_shape() {
     assert_eq!(s, r#"{"status":"reject","reason":"cap"}"#);
     let a = serde_json::to_string(&Decision::Allow).unwrap();
     assert_eq!(a, r#"{"status":"allow"}"#);
+}
+
+#[test]
+fn a_sell_that_flips_the_position_is_judged_by_the_size_it_opens() {
+    // Regression (critic round 3, 2026-11-09): any sell on an existing long used to be
+    // exempted from the position cap as a "reduction", so a sell far larger than the
+    // long could open a huge short with the cap switched off ($900 long, $20k sell,
+    // $1k cap -> allowed). A sell that flips must be judged by |position after|.
+    let mut g = Guardrail::new(cfg()); // max_position_notional 10_000
+    let c = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(900.0) };
+    // 0.25 BTC @ 80k = 20_000 -> flips to a 19_100 short -> reject
+    let d = g.allow(&intent("BTC", false, 0.25, None), c);
+    assert!(!d.is_allow(), "a flipping sell must not be exempt from the position cap: {d:?}");
+    assert!(d.rejected_reason().contains("position cap"), "{d:?}");
+    // a sell that only reduces (0.01 BTC = 800 <= 900) stays allowed
+    assert!(g.allow(&intent("BTC", false, 0.01, None), c).is_allow());
 }

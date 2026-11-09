@@ -212,6 +212,46 @@ impl HlClient {
         Ok(sum)
     }
 
+    /// The account's perp account value (USD) from the venue: `marginSummary.accountValue`.
+    /// The live path seeds the guardrail's equity with this so the leverage cap is a
+    /// statement about the real account, not about a number typed into the TOML.
+    /// Missing or non-positive value is an ERROR: a zero equity would block every order
+    /// for the wrong reason, and guessing would let an under-funded account over-lever.
+    pub fn account_equity(&self, user: &str) -> Result<f64> {
+        let st = self.clearinghouse_state(user)?;
+        let raw = st
+            .get("marginSummary")
+            .and_then(|m| m.get("accountValue"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("clearinghouseState: missing marginSummary.accountValue"))?;
+        let v = raw
+            .parse::<f64>()
+            .map_err(|e| anyhow::anyhow!("clearinghouseState: accountValue {raw:?} is not a number: {e}"))?;
+        if !v.is_finite() || v <= 0.0 {
+            return Err(anyhow::anyhow!("clearinghouseState: account value {v} is not a usable equity"));
+        }
+        Ok(v)
+    }
+
+    /// The agent addresses approved to trade for `user` (the venue's `extraAgents`).
+    /// The live path uses this at startup so "the caps read `--user`" cannot silently
+    /// mean "the caps read an account this key cannot trade for": the signed action
+    /// carries no user field, so a wrong `--user` would leave the position and
+    /// daily-loss caps reading an empty account while the order still executes.
+    pub fn extra_agents(&self, user: &str) -> Result<Vec<String>> {
+        let v = self.info(&serde_json::json!({
+            "type": "extraAgents",
+            "user": user.trim().to_ascii_lowercase()
+        }))?;
+        let arr = v
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("extraAgents: expected an array, got {}", truncate(&v.to_string(), 120)))?;
+        Ok(arr
+            .iter()
+            .filter_map(|a| a.get("address").and_then(|x| x.as_str()).map(|s| s.to_ascii_lowercase()))
+            .collect())
+    }
+
     /// Latest mid for a coin from allMids (used by the simulator as the mark).
 
     pub fn mid_of(&self, coin: &str) -> Result<f64> {

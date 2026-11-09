@@ -1,6 +1,6 @@
-//! # guardrail — the pure guardrail engine (the kit core, the add-on shared)
+//! # guardrail — the pure guardrail engine (Bet A core, Bet B shared)
 //!
-//! Own: ceo/tech (2026-11-04). Spec: this README "Week 1 (tech)".
+//! Own: ceo/tech (CEO r178, 2026-11-04). Spec: specs/hl-agent.md "Week 1 (tech)".
 //!
 //! Every guardrail decision is a pure function of (config, intent, caller-supplied
 //! [`Ctx`] / [`FillReport`]): this crate NEVER does I/O, never reads the wall clock,
