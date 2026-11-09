@@ -1,4 +1,4 @@
-//! Exchange client: the OPTIONAL signed path.
+//! Exchange client (week 2, specs/hl-agent.md §Week 2): the OPTIONAL signed path.
 //! POSTs ONE signed action to `{base}/exchange` and parses the venue's
 //! `{status:"ok"}` / `{status:"err", response:<text>}` envelope. NO retry loop —
 //! Hyperliquid's nonce window makes blind replays dangerous (see knowledge/intel/
@@ -253,18 +253,82 @@ impl ExchangeClient {
 /// sign-only by venue design — the venue rejects approval attempts from it).
 /// One approval per builder, revocable any time from the user's account.
 /// `fee_tenths_bp`: the max fee the user allows us per fill, 1..=100 (10 bp cap).
+///
+/// FIXED 2026-11-09 (critic round-4 blocker): this is a USER-SIGNED EIP-712 action,
+/// not an L1/agent action. It is signed over domain "HyperliquidSignTransaction"
+/// (version "1", chainId 0x66eee, verifyingContract 0x0) with primary type
+/// "HyperliquidTransaction:ApproveBuilderFee{string hyperliquidChain,string maxFeeRate,
+/// address builder,uint64 nonce}" — see the verified SDK notes above
+/// `signer::HL_USER_SIGNED_DOMAIN_NAME`. The old code msgpack-hashed a 3-field map and
+/// signed it as the L1 phantom Agent (domain "Exchange"/1337): the venue could never
+/// verify it, and the POSTed action was missing `hyperliquidChain` + `signatureChainId`.
 pub fn approve_builder_fee(&self, builder_addr: &str, fee_tenths_bp: u32, nonce: u64, is_mainnet: bool) -> Result<ExchangeResponse> {
-    let mp = crate::signer::approve_builder_fee_action_msgpack(builder_addr, fee_tenths_bp)?;
-    let (_, sig) = self.signer.sign_l1_action(&mp, nonce, None, is_mainnet)?;
+    let body = self.approve_builder_fee_body(builder_addr, fee_tenths_bp, nonce, is_mainnet)?;
+    self.post_body(body)
+}
+
+/// The 6-field POSTed `approveBuilderFee` action, exactly the SDK shape:
+/// `{"type","maxFeeRate","builder","hyperliquidChain","signatureChainId","nonce"}`.
+/// PURE — no network, no signing — so the operator's audit trail and the tests can
+/// inspect precisely what is (and is signed as) on the wire. JSON key order is
+/// irrelevant to the venue's parser; the SET and the VALUES are what must match the
+/// SDKs (they are the EIP-712 message, so they must equal what the signature
+/// covers). serde_json orders object keys alphabetically; field ORDER is
+/// irrelevant to the venue's JSON parser, the SET and VALUES are not.
+pub fn approve_builder_fee_action(builder_addr: &str, fee_tenths_bp: u32, nonce: u64, is_mainnet: bool) -> Result<Value> {
+    crate::signer::validate_builder_address(builder_addr)?;
+    let max_fee_rate = crate::signer::max_fee_rate_string(fee_tenths_bp)?;
     let b = builder_addr.trim().to_ascii_lowercase();
-    let max_fee_rate = format!("{}%", fee_tenths_bp as f64 / 1000.0);
-    let action = serde_json::json!({
+    Ok(serde_json::json!({
         "type": "approveBuilderFee",
         "maxFeeRate": max_fee_rate,
         "builder": b,
-    });
-    let body = Self::envelope(action, nonce, &sig);
-    self.post_body(body)
+        "hyperliquidChain": crate::signer::hyperliquid_chain_name(is_mainnet),
+        "signatureChainId": crate::signer::HL_SIGNATURE_CHAIN_ID_HEX,
+        "nonce": nonce,
+    }))
+}
+
+/// Sign the `approveBuilderFee` action and return the FULL POST envelope
+/// `{action, nonce, signature}` without sending it (session-audit path + tests).
+/// The signed values are read back out of the very object that gets POSTed, so the
+/// message and the wire body cannot drift apart.
+pub fn approve_builder_fee_body(&self, builder_addr: &str, fee_tenths_bp: u32, nonce: u64, is_mainnet: bool) -> Result<Value> {
+    self.guard_chain_flag(is_mainnet)?;
+    let action = Self::approve_builder_fee_action(builder_addr, fee_tenths_bp, nonce, is_mainnet)?;
+    let builder_str = action["builder"].as_str().unwrap_or_default().to_string();
+    let builder: alloy_primitives::Address = builder_str
+        .parse()
+        .map_err(|e| anyhow!("builder address {builder_str:?} is not a valid address: {e}"))?;
+    let max_fee_rate = action["maxFeeRate"].as_str().unwrap_or_default().to_string();
+    let (_, sig) = self.signer.sign_approve_builder_fee(builder, &max_fee_rate, nonce, is_mainnet)?;
+    Ok(Self::envelope(action, nonce, &sig))
+}
+
+/// Refuse to sign an action whose `hyperliquidChain` contradicts the base URL this
+/// client posts to (the venue rejects such a signature, and a silent mismatch is
+/// exactly the class of bug this fix removes). Unknown/custom bases are allowed
+/// through: only the two official endpoints are cross-checked.
+fn guard_chain_flag(&self, is_mainnet: bool) -> Result<()> {
+    let base_is_mainnet = if self.base == MAINNET {
+        Some(true)
+    } else if self.base == TESTNET {
+        Some(false)
+    } else {
+        None
+    };
+    if let Some(b) = base_is_mainnet {
+        if b != is_mainnet {
+            bail!(
+                "chain mismatch: client base {base} is {base_chain}, but the action would be signed \
+                 for hyperliquidChain {flag:?} — the venue would reject the signature",
+                base = self.base,
+                base_chain = if b { "MAINNET" } else { "testnet" },
+                flag = crate::signer::hyperliquid_chain_name(is_mainnet),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Keyless info query: has a user approved this builder, and up to what fee?
@@ -425,5 +489,114 @@ mod tests {
         let (connection_id, sig) = signer.sign_l1_action(&mp, nonce, None, false).unwrap();
         let recovered = AgentSigner::recover_l1_action(connection_id, false, &sig).unwrap();
         assert_eq!(recovered, signer.address(), "signature verifies against the signing key");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// approveBuilderFee = USER-SIGNED EIP-712 action (critic round-4 defect fix).
+// These tests pin the wire contract: 6 action fields (not 3), the two chain
+// fields the signature covers, a `maxFeeRate` decimal STRING, and — crucially —
+// that the wire signature is the user-signed digest over the POSTED values and
+// NOT the old L1 phantom-agent signature over the 3-field msgpack action.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests_approve_builder_fee_user_signed {
+    use super::*;
+    use crate::signer::{AgentSigner, SigEnvelope};
+
+    // Test-only key; never a real wallet.
+    const TEST_KEY: &str = "0x4646464646464646464646464646464646464646464646464646464646464646";
+    const BUILDER: &str = "0x1111111111111111111111111111111111111111";
+    const NONCE: u64 = 1_739_000_000_000;
+
+    #[test]
+    fn approve_action_json_has_exactly_the_six_sdk_fields() {
+        for is_mainnet in [true, false] {
+            let action = ExchangeClient::approve_builder_fee_action(BUILDER, 20, NONCE, is_mainnet).unwrap();
+            let obj = action.as_object().unwrap();
+            // serde_json's default map is a BTreeMap, so key ORDER is alphabetical
+            // here; JSON object order is irrelevant to the venue's parser. What must
+            // match the SDK is the SET of field names and their values.
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            let mut want = ["type", "maxFeeRate", "builder", "hyperliquidChain", "signatureChainId", "nonce"];
+            want.sort_unstable();
+            assert_eq!(
+                keys,
+                want.to_vec(),
+                "the POSTed approveBuilderFee action must carry exactly the 6 SDK fields"
+            );
+            assert_eq!(obj.len(), 6, "6 fields, not the old 3");
+            assert_eq!(action["type"], "approveBuilderFee");
+            assert_eq!(action["maxFeeRate"], "0.02%");
+            assert_eq!(action["builder"], BUILDER);
+            assert_eq!(action["signatureChainId"], "0x66eee");
+            assert_eq!(action["nonce"], serde_json::json!(NONCE));
+            assert_eq!(
+                action["hyperliquidChain"],
+                if is_mainnet { "Mainnet" } else { "Testnet" },
+                "hyperliquidChain must follow is_mainnet (the replay guard)"
+            );
+            // maxFeeRate is a STRING ending in '%' in both SDKs.
+            assert!(action["maxFeeRate"].is_string());
+            assert!(action["maxFeeRate"].as_str().unwrap().ends_with('%'));
+        }
+    }
+
+    #[test]
+    fn approve_body_signs_the_posted_action_not_an_l1_msgpack() {
+        let signer = AgentSigner::from_hex_key(TEST_KEY).unwrap();
+        let signer_addr = signer.address();
+        let client = ExchangeClient::testnet(signer);
+        let body = client.approve_builder_fee_body(BUILDER, 50, NONCE, false).unwrap();
+        let keys: Vec<&str> = body.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, vec!["action", "nonce", "signature"]);
+        assert_eq!(body["action"]["maxFeeRate"], "0.05%");
+        assert_eq!(body["action"]["hyperliquidChain"], "Testnet");
+        assert_eq!(body["action"]["signatureChainId"], "0x66eee");
+
+        // Rebuild the user-signed digest FROM THE POSTED ACTION and ecrecover it:
+        // this is exactly what the venue does, so a mismatch here = a rejected approval.
+        let a = &body["action"];
+        let hash = crate::signer::approve_builder_fee_signing_hash(
+            a["hyperliquidChain"].as_str().unwrap(),
+            a["maxFeeRate"].as_str().unwrap(),
+            a["builder"].as_str().unwrap().parse().unwrap(),
+            a["nonce"].as_u64().unwrap(),
+            crate::signer::HL_SIGNATURE_CHAIN_ID,
+        );
+        let sig = SigEnvelope {
+            r: body["signature"]["r"].as_str().unwrap().to_string(),
+            s: body["signature"]["s"].as_str().unwrap().to_string(),
+            v: body["signature"]["v"].as_u64().unwrap() as u8,
+        };
+        assert_eq!(
+            AgentSigner::recover_user_signed(hash, &sig).unwrap(),
+            signer_addr,
+            "the POSTed action + signature must ecrecover to the signer (what the venue checks)"
+        );
+
+        // The OLD path (L1 phantom agent over the 3-field msgpack) yields a DIFFERENT
+        // signature: prove the wire signature is no longer that one.
+        let signer = AgentSigner::from_hex_key(TEST_KEY).unwrap();
+        let mp = crate::signer::approve_builder_fee_action_msgpack(BUILDER, 50).unwrap();
+        let (_, l1_sig) = signer.sign_l1_action(&mp, NONCE, None, false).unwrap();
+        assert_ne!(sig, l1_sig, "approveBuilderFee must NOT be signed as an L1/agent action");
+    }
+
+    #[test]
+    fn approve_body_rejects_chain_flag_that_contradicts_the_base() {
+        let testnet = ExchangeClient::testnet(AgentSigner::from_hex_key(TEST_KEY).unwrap());
+        assert!(
+            testnet.approve_builder_fee_body(BUILDER, 20, NONCE, true).is_err(),
+            "a testnet client must not sign hyperliquidChain=Mainnet"
+        );
+        let mainnet = ExchangeClient::new(MAINNET, AgentSigner::from_hex_key(TEST_KEY).unwrap());
+        assert!(mainnet.approve_builder_fee_body(BUILDER, 20, NONCE, false).is_err());
+        assert!(mainnet.approve_builder_fee_body(BUILDER, 20, NONCE, true).is_ok());
+        // fee/address validation reaches the wire constructor too
+        assert!(ExchangeClient::approve_builder_fee_action("not-an-address", 20, NONCE, false).is_err());
+        assert!(ExchangeClient::approve_builder_fee_action(BUILDER, 0, NONCE, false).is_err());
+        assert!(ExchangeClient::approve_builder_fee_action(BUILDER, 101, NONCE, false).is_err());
     }
 }

@@ -75,11 +75,18 @@ pub trait Venue {
     fn size_decimals(&self, coin: &str) -> Result<u32>;
     /// The venue's own view of the user's approved max builder fee (tenths of bp).
     fn max_builder_fee(&self, user: &str, builder: &str) -> Result<u32>;
-    /// Current |position| notional (USD) on the user's account for `coin`.
-    /// The position cap CANNOT be enforced without this: the guardrail engine is
-    /// pure and sees no account. `Err` means "unknown" and the order is refused.
-    fn position_notional(&self, _user: &str, _coin: &str, _mark: f64) -> Result<f64> {
+    /// Current position notional (USD) on the user's account for `coin`, SIGNED
+    /// (long > 0, short < 0). The position cap needs the side: from |position|
+    /// alone a sell against a short looks like a reduction and the cap switches off
+    /// for the order that doubles it (critic round 4). `Err` means "unknown" and
+    /// the order is refused.
+    fn position_signed_notional(&self, _user: &str, _coin: &str, _mark: f64) -> Result<f64> {
         bail!("this venue cannot report account positions, so the position cap cannot be enforced")
+    }
+    /// The account's real equity (USD), read per order. The leverage cap is a
+    /// statement about the real account; a TOML number a user typed is a wish.
+    fn account_equity(&self, _user: &str) -> Result<f64> {
+        bail!("this venue cannot report account equity, so the leverage cap cannot be enforced")
     }
     /// Venue-reported realized PnL (USD) since `start_ms`, to seed the daily-loss cap.
     fn realized_pnl_since(&self, _user: &str, _start_ms: i64) -> Result<f64> {
@@ -146,8 +153,12 @@ impl Venue for HlVenue {
         self.ex.max_builder_fee(user, builder)
     }
 
-    fn position_notional(&self, user: &str, coin: &str, mark: f64) -> Result<f64> {
-        self.hl.position_notional(user, coin, mark)
+    fn position_signed_notional(&self, user: &str, coin: &str, mark: f64) -> Result<f64> {
+        self.hl.position_signed_notional(user, coin, mark)
+    }
+
+    fn account_equity(&self, user: &str) -> Result<f64> {
+        self.hl.account_equity(user)
     }
 
     fn realized_pnl_since(&self, user: &str, start_ms: i64) -> Result<f64> {
@@ -254,13 +265,15 @@ impl<V: Venue> LiveTrader<V> {
         };
 
         // 1) GUARDRAILS, BEFORE ANY SIGNATURE EXISTS. The engine is pure, so it needs
-        //    the account state handed to it: the real position notional (else the
-        //    position cap never runs) and the venue's realized PnL today (else the
-        //    daily-loss cap can never trip). Both reads fail CLOSED: an unknown
-        //    account state refuses the order rather than signing it unguarded.
-        let position_notional = match self.venue.position_notional(&self.cfg.user, &req.coin, mark) {
-            Ok(p) if p.is_finite() && p >= 0.0 => p,
-            Ok(p) => return Ok(reject(format!("venue reported a nonsense position notional ({p}) for {}", req.coin))),
+        //    the account state handed to it: the SIGNED position notional (so the cap
+        //    knows a sell against a short is not a reduction), the account's REAL
+        //    equity (so the leverage cap is about this account, not a TOML wish), and
+        //    the venue's realized PnL today (else the daily-loss cap can never trip).
+        //    All three reads fail CLOSED: an unknown account state refuses the order
+        //    rather than signing it unguarded.
+        let position_signed = match self.venue.position_signed_notional(&self.cfg.user, &req.coin, mark) {
+            Ok(p) if p.is_finite() => p,
+            Ok(p) => return Ok(reject(format!("venue reported a nonsense position ({p}) for {}", req.coin))),
             Err(e) => {
                 return Ok(reject(format!(
                     "could not read your current {} position ({e}), so the position cap cannot be enforced — order NOT signed",
@@ -268,6 +281,18 @@ impl<V: Venue> LiveTrader<V> {
                 )))
             }
         };
+        let position_notional = position_signed.abs();
+        let equity = match self.venue.account_equity(&self.cfg.user) {
+            Ok(e) if e.is_finite() && e > 0.0 => e,
+            Ok(e) => return Ok(reject(format!("venue reported an unusable account equity ({e}) — order NOT signed"))),
+            Err(e) => {
+                return Ok(reject(format!(
+                    "could not read your account equity ({e}), so the leverage cap cannot be enforced — order NOT signed"
+                )))
+            }
+        };
+        // SET, never add: the venue's figure is the account, not a delta.
+        self.gate.cfg.account_equity_usd = equity;
         let day_start_ms = now_ms.div_euclid(86_400_000) * 86_400_000;
         match self.venue.realized_pnl_since(&self.cfg.user, day_start_ms) {
             Ok(pnl) if pnl.is_finite() => {
@@ -284,7 +309,12 @@ impl<V: Venue> LiveTrader<V> {
         let intent = req.intent();
         let decision = self.gate.allow(
             &intent,
-            Ctx { now_ms, mark: Some(mark), position_notional: Some(position_notional) },
+            Ctx {
+                now_ms,
+                mark: Some(mark),
+                position_notional: Some(position_notional),
+                position_signed: Some(position_signed),
+            },
         );
         if let Decision::Reject { reason } = decision {
             return Ok(reject(format!("guardrail: {reason}")));
@@ -567,8 +597,10 @@ mod tests {
     struct FakeVenue {
         mark: Option<f64>,
         approved: u32,
-        /// |position| notional the fake account reports for the coin.
+        /// SIGNED position notional the fake account reports for the coin.
         position: RefCell<f64>,
+        /// Real equity the fake account reports (leverage cap is fed from this).
+        equity: RefCell<f64>,
         /// realized PnL today the fake account reports.
         pnl_today: RefCell<f64>,
         sign_calls: RefCell<u32>,
@@ -588,6 +620,7 @@ mod tests {
                 mark,
                 approved,
                 position: RefCell::new(0.0),
+                equity: RefCell::new(500.0),
                 pnl_today: RefCell::new(0.0),
                 sign_calls: RefCell::new(0),
                 posts: RefCell::new(Vec::new()),
@@ -609,8 +642,11 @@ mod tests {
         fn max_builder_fee(&self, _user: &str, _builder: &str) -> Result<u32> {
             Ok(self.approved)
         }
-        fn position_notional(&self, _user: &str, _coin: &str, _mark: f64) -> Result<f64> {
+        fn position_signed_notional(&self, _user: &str, _coin: &str, _mark: f64) -> Result<f64> {
             Ok(*self.position.borrow())
+        }
+        fn account_equity(&self, _user: &str) -> Result<f64> {
+            Ok(*self.equity.borrow())
         }
         fn realized_pnl_since(&self, _user: &str, _start_ms: i64) -> Result<f64> {
             Ok(*self.pnl_today.borrow())
@@ -856,6 +892,76 @@ mod tests {
             other => panic!("expected Unknown, got {other:?}"),
         }
         assert_eq!(*t.venue.sign_calls.borrow(), 1, "exactly one attempt, never a retry");
+    }
+
+    /// Critic round 4 (2026-11-09): a SELL against a short is not a reduction. From
+    /// |position| alone the cap switched off for the order that doubles the short.
+    #[test]
+    fn a_sell_that_doubles_a_short_is_refused_before_signing() {
+        let venue = FakeVenue::new(Some(2000.0), 20);
+        *venue.position.borrow_mut() = -4000.0; // SHORT $4,000
+        let mut t = LiveTrader::new(venue, cfg(true), gate());
+        t.gate.cfg.max_order_notional_usd = 100_000.0;
+        t.gate.cfg.max_position_notional_usd = 5_000.0;
+        t.gate.cfg.account_equity_usd = 100_000.0;
+        let mut r = req(1.0); // sell 1 ETH @2000 = $2,000 -> short $6,000 > $5,000 cap
+        r.is_buy = false;
+        match t.place(&r, 1_730_000_000_000).unwrap() {
+            LiveOutcome::Rejected { reason, signed, sent } => {
+                assert!(reason.contains("position cap"), "got {reason}");
+                assert!(!signed && !sent);
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(*t.venue.sign_calls.borrow(), 0, "must refuse before any signature");
+    }
+
+    /// The mirror harm: a buy that CLOSES a short must never be blocked by the cap.
+    #[test]
+    fn a_buy_that_closes_a_short_still_goes_through() {
+        let venue = FakeVenue::new(Some(2000.0), 20);
+        *venue.position.borrow_mut() = -12_000.0; // short beyond the $1,000 cap
+        let mut t = LiveTrader::new(venue, cfg(true), gate());
+        *t.venue.equity.borrow_mut() = 100_000.0; // real equity is large: only the cap matters
+        t.gate.cfg.max_order_notional_usd = 100_000.0;
+        let mut r = req(1.0); // buy 1 ETH = $2,000 -> short $10,000: still shrinking
+        r.is_buy = true;
+        match t.place(&r, 1_730_000_000_000).unwrap() {
+            LiveOutcome::Placed { builder_attached, .. } => assert!(builder_attached),
+            other => panic!("closing a short must not be blocked, got {other:?}"),
+        }
+    }
+
+    /// Critic round 4 item 2: the leverage cap must use the account's REAL equity, read
+    /// per order, not the TOML number the user typed.
+    #[test]
+    fn the_leverage_cap_uses_the_venue_reported_equity() {
+        let venue = FakeVenue::new(Some(2000.0), 20);
+        *venue.equity.borrow_mut() = 5.0; // a $5 account, TOML claims 500
+        let mut t = LiveTrader::new(venue, cfg(true), gate());
+        t.gate.cfg.max_leverage = 2.0;
+        let out = t.place(&req(0.01), 1_730_000_000_000).unwrap(); // $20 order > 2 x $5
+        match out {
+            LiveOutcome::Rejected { reason, .. } => assert!(reason.contains("max_leverage"), "got {reason}"),
+            other => panic!("expected the leverage cap to bind on real equity, got {other:?}"),
+        }
+        assert_eq!(*t.venue.sign_calls.borrow(), 0);
+    }
+
+    /// An unreadable equity must refuse: silence is not consent.
+    #[test]
+    fn an_unreadable_equity_refuses_to_sign() {
+        let venue = FakeVenue::new(Some(2000.0), 20);
+        *venue.equity.borrow_mut() = f64::NAN;
+        let mut t = LiveTrader::new(venue, cfg(true), gate());
+        match t.place(&req(0.01), 1_730_000_000_000).unwrap() {
+            LiveOutcome::Rejected { reason, signed, sent } => {
+                assert!(reason.contains("equity"), "got {reason}");
+                assert!(!signed && !sent);
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(*t.venue.sign_calls.borrow(), 0);
     }
 
     #[test]

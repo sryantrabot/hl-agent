@@ -194,7 +194,7 @@ fn clock_skew_backwards_is_safe() {
 fn position_cap_rejects_growth_allows_reduction() {
     let mut g = Guardrail::new(cfg()); // max_position_notional 10_000
     // long 0.1 BTC @ 80k = 8_000; buying 0.05 more -> 12_000 > 10_000 -> reject
-    let c = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(8_000.0) };
+    let c = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(8_000.0), position_signed: Some(8_000.0) };
     let d = g.allow(&intent("BTC", true, 0.05, None), c);
     assert!(!d.is_allow());
     assert!(d.rejected_reason().contains("position cap"), "{d:?}");
@@ -211,7 +211,7 @@ fn position_cap_rejects_growth_allows_reduction() {
 #[test]
 fn position_cap_requires_a_mark() {
     let mut g = Guardrail::new(cfg());
-    let c = Ctx { now_ms: 1_000, mark: None, position_notional: Some(8_000.0) };
+    let c = Ctx { now_ms: 1_000, mark: None, position_notional: Some(8_000.0), position_signed: Some(8_000.0) };
     let d = g.allow(&intent("BTC", true, 0.01, None), c);
     assert!(!d.is_allow());
     assert!(d.rejected_reason().contains("mark"), "{d:?}");
@@ -524,11 +524,83 @@ fn a_sell_that_flips_the_position_is_judged_by_the_size_it_opens() {
     // long could open a huge short with the cap switched off ($900 long, $20k sell,
     // $1k cap -> allowed). A sell that flips must be judged by |position after|.
     let mut g = Guardrail::new(cfg()); // max_position_notional 10_000
-    let c = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(900.0) };
+    let c = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(900.0), position_signed: Some(900.0) };
     // 0.25 BTC @ 80k = 20_000 -> flips to a 19_100 short -> reject
     let d = g.allow(&intent("BTC", false, 0.25, None), c);
     assert!(!d.is_allow(), "a flipping sell must not be exempt from the position cap: {d:?}");
     assert!(d.rejected_reason().contains("position cap"), "{d:?}");
     // a sell that only reduces (0.01 BTC = 800 <= 900) stays allowed
     assert!(g.allow(&intent("BTC", false, 0.01, None), c).is_allow());
+}
+
+// -------------------------------------- critic round 4: SIGNED position ---
+
+#[test]
+fn a_sell_against_a_short_is_judged_by_the_short_it_doubles() {
+    // Critic round 4 (2026-11-09): from |position| alone every sell looked like a
+    // reduction, so a sell that DOUBLES a short had the position cap off (repeatable:
+    // |position| could be doubled per signed order without bound). Short $4,000, cap
+    // $10,000, sell 4 BTC @ 80k => $324,000 short => must reject.
+    let mut g = Guardrail::new(cfg()); // max_position_notional 10_000, order cap 1000
+    let c = Ctx {
+        now_ms: 1_000,
+        mark: Some(80_000.0),
+        position_notional: Some(4_000.0),
+        position_signed: Some(-4_000.0),
+    };
+    // small enough to pass the $1,000 order cap: 0.012 BTC = $960 -> short grows to $4,960
+    assert!(g.allow(&intent("BTC", false, 0.012, None), c).is_allow(), "a sell that only grows the short a little is inside the cap");
+    // a sell that takes the short past the cap is refused (isolate the position cap)
+    let cfg2 = {
+        let mut c2 = cfg();
+        c2.max_order_notional_usd = 1_000_000.0; // isolate the position cap
+        c2
+    };
+    let mut g2 = Guardrail::new(cfg2.clone());
+    let c2 = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(4_000.0), position_signed: Some(-4_000.0) };
+    let d = g2.allow(&intent("BTC", false, 0.10, None), c2); // 0.1 BTC = $8,000 -> short 12,000 > 10,000 cap
+    assert!(!d.is_allow(), "a sell that doubles a short past the cap must be refused: {d:?}");
+    assert!(d.rejected_reason().contains("position cap"), "{d:?}");
+}
+
+#[test]
+fn a_buy_that_closes_a_short_is_allowed_even_above_the_cap() {
+    // The mirror harm (same critic round): a buy that CLOSES a short used to read as if
+    // it opened one and could block the user's own exit. The cap judges |position
+    // after|, and shrinking an already-over-cap position is never blocked.
+    let mut c_at = cfg();
+    c_at.max_order_notional_usd = 1_000_000.0;
+    let mut g = Guardrail::new(c_at);
+    // Short $12,000 (already past the $10,000 cap), buy 0.1 BTC = $8,000 -> $4,000 short.
+    let c = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(12_000.0), position_signed: Some(-12_000.0) };
+    assert!(g.allow(&intent("BTC", true, 0.10, None), c).is_allow(), "closing a short must never be blocked");
+    // but a buy that FLIPS it to a $4,000 long beyond the cap is judged by the size it opens
+    let mut g2 = Guardrail::new(cfg());
+    let c_close = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(12_000.0), position_signed: Some(-12_000.0) };
+    let d = g2.allow(&intent("BTC", true, 0.30, None), c_close); // $24,000 -> +$12,000 long
+    assert!(!d.is_allow(), "a buy that flips past the cap must be refused: {d:?}");
+}
+
+#[test]
+fn an_unreadable_signed_position_is_a_reject_not_a_skip() {
+    let mut g = Guardrail::new(cfg());
+    let c = Ctx { now_ms: 1_000, mark: Some(80_000.0), position_notional: Some(900.0), position_signed: Some(f64::NAN) };
+    let d = g.allow(&intent("BTC", true, 0.001, None), c);
+    assert!(!d.is_allow(), "NaN signed position must not silently disable the cap: {d:?}");
+    assert!(d.rejected_reason().contains("position_signed"), "{d:?}");
+}
+
+#[test]
+fn a_limit_far_above_the_mark_is_priced_at_the_limit_for_the_order_cap() {
+    // Critic round 4 item 3: the notional used to be sized at the mid only, so a
+    // "<= $1,000" buy at limit 200_000 against a 2_000 mid could sweep a thin book for
+    // up to 100x the cap. The signed price is the only protection the kit has.
+    let mut g = Guardrail::new(cfg()); // order cap 1000
+    let c = Ctx::simple(1_000_000, Some(2_000.0));
+    let d = g.allow(&intent("ETH", true, 0.25, Some(200_000.0)), c);
+    assert!(!d.is_allow(), "an order at 100x the mid must blow the order cap: {d:?}");
+    assert!(d.rejected_reason().contains("order notional"), "{d:?}");
+    // a limit BELOW the mark is still safe (a buy can only fill at or under its limit)
+    let mut g2 = Guardrail::new(cfg());
+    assert!(g2.allow(&intent("ETH", true, 0.4, Some(2_000.0)), Ctx::simple(1_000_000, Some(2_000.0))).is_allow());
 }

@@ -23,8 +23,13 @@
 //! vectors in tests (test_limit_order_action_hashing / test_tpsl_order_action_hashing
 //! from exchange_client.rs): same key + action + nonce => identical r/s/v.
 //! Known limitations (documented, honest): expires_after NOT supported (the official
-//! Rust SDK omits it too); cloid NOT supported; ApproveBuilderFee/agent approvals are
-//! user-signed EIP-712 actions — out of scope here (README guides the user through it).
+//! Rust SDK omits it too); cloid NOT supported; approveAgent is out of scope.
+//! 2026-11-09 (critic round-4 fix): ApproveBuilderFee IS implemented below — as the
+//! USER-SIGNED EIP-712 action it really is (domain "HyperliquidSignTransaction",
+//! primary type "HyperliquidTransaction:ApproveBuilderFee"), NOT as an L1 action.
+//! Entry points: `AgentSigner::sign_approve_builder_fee` +
+//! `ExchangeClient::approve_builder_fee`; the legacy msgpack helper below is kept
+//! for API compatibility only and must never be used to sign the wire action.
 use alloy_primitives::{keccak256, Address, B256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
@@ -570,17 +575,23 @@ mod tests {
 }
 
 // ---------- ApproveBuilderFee (the one-time, revocable main-wallet approval) ----------
-// Wire truth (knowledge/intel/2026-11-05-agent-pain/hl-builder-codes.md, docs verified
-// live 2026-11-04): the approval is an EXCHANGE L1 action {"type":"approveBuilderFee",
-// "maxFeeRate": "<f> tenths of bp as a decimal string", "builder": "0x…"}, signed by the
+// Wire truth (knowledge/intel/2026-11-05-agent-pain/hl-builder-codes.md + BOTH official
+// SDKs fetched live 2026-11-09): the approval is a USER-SIGNED EIP-712 transaction — NOT
+// an L1/agent action — whose message is {"type":"approveBuilderFee", "maxFeeRate": a
+// decimal string ending in '%' like "0.02%", "builder": "0x…", "hyperliquidChain":
+// "Mainnet"|"Testnet", "signatureChainId": "0x66eee", "nonce": <ms>}, signed by the
 // USER'S MAIN WALLET — an API/agent wallet CANNOT approve (sign-only by design). One
-// approval per builder, max 10 active per user, revocable any time. `maxFeeRate` mirrors
-// the SDK's ApproveBuilderFee declaration: a decimal STRING like "0.02%" (2 bp of the
-// quote-asset fee). We always emit the exact-percent string form; f tenths-of-bp must be
-// a multiple of 10 or the percent has a fractional part the venue parses as a float —
-// both forms are legal on the wire, we pick integer tenths to keep the msgpack
-// byte-exact with the pinned SDK encoding (strings, declaration order).
+// approval per builder, max 10 active per user, revocable any time. The near-duplicate
+// below (`approve_builder_fee_action_msgpack`) is the OLD 3-field L1 msgpack form: it is
+// kept for API compatibility and historical shape tests only, it is NOT signable wire.
 
+/// **LEGACY — NOT THE SIGNED FORM, do not sign the wire action with this.** Kept only
+/// because the week-2 public API surface (lib.rs re-export) and the historical shape
+/// tests reference it. The venue verifies approveBuilderFee as a USER-SIGNED EIP-712
+/// action (`sign_approve_builder_fee` / `ExchangeClient::approve_builder_fee`); an
+/// L1-style hash of this 3-field map is never accepted, and the POSTed action also
+/// needs `hyperliquidChain` + `signatureChainId`.
+///
 /// msgpack for the approveBuilderFee action — rmp_serde::to_vec_named shape for the
 /// SDK's Actions::ApproveBuilderFee(ApproveBuilderFee{max_fee_rate, builder}):
 /// {"type":"approveBuilderFee","maxFeeRate":<str>,"builder":<str>} in declaration order.
@@ -609,4 +620,351 @@ pub fn validate_builder_address(builder_addr: &str) -> Result<()> {
         bail!("builder address must be a 0x-prefixed 20-byte hex address, got {builder_addr:?}");
     }
     Ok(())
+}
+
+// ===========================================================================
+// USER-SIGNED EIP-712 ACTION: approveBuilderFee  (critic round-4 defect fix)
+// ===========================================================================
+// VERIFIED against BOTH official SDKs (fetched live 2026-11-09):
+//
+// hyperliquid-python-sdk @ master, hyperliquid/utils/signing.py:
+//   def sign_approve_builder_fee(wallet, action, is_mainnet):
+//       return sign_user_signed_action(wallet, action,
+//           [{"name":"hyperliquidChain","type":"string"},
+//            {"name":"maxFeeRate","type":"string"},
+//            {"name":"builder","type":"address"},
+//            {"name":"nonce","type":"uint64"}],
+//           "HyperliquidTransaction:ApproveBuilderFee", is_mainnet)
+//   def sign_user_signed_action(wallet, action, payload_types, primary_type, is_mainnet):
+//       action["signatureChainId"] = "0x66eee"
+//       action["hyperliquidChain"] = "Mainnet" if is_mainnet else "Testnet"
+//       return sign_inner(wallet, user_signed_payload(primary_type, payload_types, action))
+//   def user_signed_payload(...):  # EIP-712 typed data
+//       domain = {"name": "HyperliquidSignTransaction", "version": "1",
+//                 "chainId": int(action["signatureChainId"], 16),   # 0x66eee = 421614
+//                 "verifyingContract": "0x0000...0000"}
+// and hyperliquid/exchange.py:
+//   def approve_builder_fee(self, builder, max_fee_rate):
+//       timestamp = get_timestamp_ms()                 # int(time.time() * 1000)
+//       action = {"maxFeeRate": max_fee_rate, "builder": builder,
+//                 "nonce": timestamp, "type": "approveBuilderFee"}
+//       signature = sign_approve_builder_fee(self.wallet, action, mainnet)
+//       return self._post_action(action, signature, timestamp)
+//   => the POSTed `action` object IS the dict the signature covers, after the
+//      signer added the two chain fields => 6 keys, not 3.
+//
+// hyperliquid-rust-sdk @ master, src/exchange/actions.rs:
+//   #[derive(Serialize)] #[serde(rename_all="camelCase")]
+//   pub struct ApproveBuilderFee {
+//       #[serde(serialize_with="serialize_hex")] signature_chain_id: u64, // "0x66eee"
+//       hyperliquid_chain: String, builder: Address, max_fee_rate: String, nonce: u64 }
+//   fn struct_hash(&self) -> B256 {
+//       let items = (keccak256("HyperliquidTransaction:ApproveBuilderFee(\
+//                              string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)"),
+//                    keccak256(&self.hyperliquid_chain), keccak256(&self.max_fee_rate),
+//                    &self.builder, &self.nonce);
+//       keccak256(items.abi_encode()) }
+//   domain = eip712_domain!{ name: "HyperliquidSignTransaction", version: "1",
+//                            chain_id: self.signature_chain_id, verifying_contract: Address::ZERO }
+//   src/signature/create_signature.rs::sign_typed_data  =>  wallet.sign_hash_sync(&eip712_signing_hash())
+//   where eip712_signing_hash = keccak256(0x1901 ++ domain.hash_struct() ++ struct_hash()).
+// That SDK pins a byte-exact vector for THIS struct (test_approve_builder_fee_signing):
+//   key e908f8…688e, builder 0x1234…7890, maxFeeRate "0.001%", nonce 1583838,
+//   mainnet sig 0x343c9078…391b / testnet sig 0x2ada43ee…d71c — reproduced in the
+//   test module below, so our hand-rolled encoder is proven against the SDK.
+//
+// WHAT THE OLD CODE DID (the defect): it msgpack-hashed a 3-field
+// {"type","maxFeeRate","builder"} map and signed it through the L1 PHANTOM-AGENT
+// path (domain "Exchange"/1337, primary type "Agent", plus a nonce+vault flag
+// outside the struct) and POSTed those 3 fields only. approveBuilderFee is a
+// USER-SIGNED action: the venue verifies domain "HyperliquidSignTransaction"/0x66eee
+// with primary type "HyperliquidTransaction:ApproveBuilderFee", and its POSTed
+// action must carry hyperliquidChain + signatureChainId. The old signature could
+// never verify — the approval always failed.
+
+/// EIP-712 domain NAME of a Hyperliquid USER-SIGNED action (both SDKs). Note this is
+/// NOT the L1 phantom-agent domain ("Exchange"), nor mainnet's chain id.
+pub const HL_USER_SIGNED_DOMAIN_NAME: &str = "HyperliquidSignTransaction";
+
+/// `signatureChainId` the SDKs pin for user-signed actions: 0x66eee = 421614.
+pub const HL_SIGNATURE_CHAIN_ID: u64 = 0x66eee;
+
+/// The wire form of `signatureChainId` (both SDKs serialize it as hex, not decimal).
+pub const HL_SIGNATURE_CHAIN_ID_HEX: &str = "0x66eee";
+
+/// EIP-712 primary type of the builder-fee approval.
+pub const APPROVE_BUILDER_FEE_PRIMARY_TYPE: &str = "HyperliquidTransaction:ApproveBuilderFee";
+
+/// The struct type string — field order/types are part of the hash, byte for byte.
+pub const APPROVE_BUILDER_FEE_TYPE_STR: &str = "HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)";
+
+/// `hyperliquidChain` value: the replay guard between mainnet and testnet.
+pub fn hyperliquid_chain_name(is_mainnet: bool) -> &'static str {
+    if is_mainnet {
+        "Mainnet"
+    } else {
+        "Testnet"
+    }
+}
+
+fn abi_word_u64(v: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&v.to_be_bytes()); // uint64 left-padded to 32 bytes
+    w
+}
+
+fn abi_word_address(a: Address) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(a.as_slice()); // address left-padded to 32 bytes
+    w
+}
+
+/// EIP-712 DOMAIN SEPARATOR of a Hyperliquid user-signed transaction:
+/// keccak256(EIP712Domain-typehash ++ keccak("HyperliquidSignTransaction")
+///          ++ keccak("1") ++ uint256(signatureChainId) ++ address(0x0)).
+///
+/// `signature_chain_id` is the action's `signatureChainId` (0x66eee), NOT 42161
+/// (mainnet) and NOT the L1 phantom-agent domain's 1337 — that mix-up is what made
+/// the old approveBuilderFee signature unverifiable.
+pub fn user_signed_domain_separator(signature_chain_id: u64) -> B256 {
+    let mut buf = Vec::with_capacity(32 * 5);
+    buf.extend_from_slice(keccak256(DOMAIN_TYPE_STR.as_bytes()).as_slice());
+    buf.extend_from_slice(keccak256(HL_USER_SIGNED_DOMAIN_NAME.as_bytes()).as_slice());
+    buf.extend_from_slice(keccak256(b"1").as_slice());
+    buf.extend_from_slice(&abi_word_u64(signature_chain_id));
+    buf.extend_from_slice(&abi_word_address(Address::ZERO));
+    keccak256(&buf)
+}
+
+/// keccak256 of the EIP-712 struct hash of
+/// `HyperliquidTransaction:ApproveBuilderFee{string,string,address,uint64}`.
+/// All four fields are static, so ABI encoding is a plain concatenation of words.
+pub fn approve_builder_fee_struct_hash(
+    hyperliquid_chain: &str,
+    max_fee_rate: &str,
+    builder: Address,
+    nonce: u64,
+) -> B256 {
+    let mut buf = Vec::with_capacity(32 * 5);
+    buf.extend_from_slice(keccak256(APPROVE_BUILDER_FEE_TYPE_STR.as_bytes()).as_slice());
+    buf.extend_from_slice(keccak256(hyperliquid_chain.as_bytes()).as_slice());
+    buf.extend_from_slice(keccak256(max_fee_rate.as_bytes()).as_slice());
+    buf.extend_from_slice(&abi_word_address(builder));
+    buf.extend_from_slice(&abi_word_u64(nonce));
+    keccak256(&buf)
+}
+
+/// The digest actually signed: keccak256(0x1901 ++ domainSeparator ++ structHash).
+pub fn approve_builder_fee_signing_hash(
+    hyperliquid_chain: &str,
+    max_fee_rate: &str,
+    builder: Address,
+    nonce: u64,
+    signature_chain_id: u64,
+) -> B256 {
+    let mut buf = Vec::with_capacity(2 + 32 + 32);
+    buf.extend_from_slice(&[0x19, 0x01]);
+    buf.extend_from_slice(user_signed_domain_separator(signature_chain_id).as_slice());
+    buf.extend_from_slice(
+        approve_builder_fee_struct_hash(hyperliquid_chain, max_fee_rate, builder, nonce).as_slice(),
+    );
+    keccak256(&buf)
+}
+
+/// `maxFeeRate` wire string for a fee in TENTHS of a basis point (the kit's `f`,
+/// 1..=100 == 0.001%..0.1%). Both SDKs pass this through as an opaque decimal
+/// STRING ending in '%' (the venue parses it, and the signature covers it verbatim),
+/// so it is rendered with exact integer arithmetic — never a binary float.
+pub fn max_fee_rate_string(fee_tenths_bp: u32) -> Result<String> {
+    if fee_tenths_bp == 0 || fee_tenths_bp > 100 {
+        bail!(
+            "builder fee {fee_tenths_bp} must be 1..=100 tenths of bp (this kit caps at the venue \
+             perp limit 10 bp = 0.1%); 1 bp = 0.01%, 1 tenth of a bp = 0.001%"
+        );
+    }
+    let whole = fee_tenths_bp / 1000; // always 0 under the cap, kept general
+    let frac = fee_tenths_bp % 1000;
+    let mut frac_s = format!("{frac:03}");
+    while frac_s.ends_with('0') {
+        frac_s.pop();
+    }
+    Ok(if frac_s.is_empty() { format!("{whole}%") } else { format!("{whole}.{frac_s}%") })
+}
+
+/// Validate a `maxFeeRate` string before it is signed: it must be a plain decimal
+/// percentage ending in '%' inside (0%, 0.1%] — what the venue accepts and what our
+/// own cap allows. Rejecting here beats signing a string the venue will misread.
+pub fn validate_max_fee_rate(max_fee_rate: &str) -> Result<()> {
+    let s = max_fee_rate.trim();
+    let pct = s
+        .strip_suffix('%')
+        .ok_or_else(|| anyhow!("maxFeeRate {s:?} must be a percentage string ending in '%', e.g. \"0.02%\""))?;
+    if pct.is_empty()
+        || !pct.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || pct.matches('.').count() > 1
+    {
+        bail!("maxFeeRate {s:?} must be a plain decimal percentage like \"0.02%\"");
+    }
+    let value: f64 = pct
+        .parse()
+        .map_err(|_| anyhow!("maxFeeRate {s:?}: {pct:?} is not a decimal number"))?;
+    if !(value > 0.0) {
+        bail!("maxFeeRate {s:?} must be greater than 0%");
+    }
+    if value > 0.1 {
+        bail!(
+            "maxFeeRate {s:?} exceeds this kit's 0.1% (10 bp) cap — the venue allows 0.1% for \
+             perps / 1% for spot, we stay under both"
+        );
+    }
+    Ok(())
+}
+
+impl AgentSigner {
+    /// Sign a Hyperliquid USER-SIGNED `approveBuilderFee` action (see the block
+    /// comment above). The caller's key MUST be the user's MAIN wallet: an API/agent
+    /// wallet cannot approve a builder fee.
+    ///
+    /// Returns `(signing_hash, envelope)`; same key + same (chain, fee, builder,
+    /// nonce) always yields the same hash and the same RFC-6979 signature. The
+    /// `action` to POST must be the 6-field JSON built by
+    /// `ExchangeClient::approve_builder_fee_action` — it carries exactly the values
+    /// signed here (`hyperliquidChain`, `maxFeeRate`, `builder`, `nonce`) plus the
+    /// type tag and `signatureChainId`.
+    pub fn sign_approve_builder_fee(
+        &self,
+        builder: Address,
+        max_fee_rate: &str,
+        nonce: u64,
+        is_mainnet: bool,
+    ) -> Result<(B256, SigEnvelope)> {
+        validate_max_fee_rate(max_fee_rate)?;
+        let hash = approve_builder_fee_signing_hash(
+            hyperliquid_chain_name(is_mainnet),
+            max_fee_rate,
+            builder,
+            nonce,
+            HL_SIGNATURE_CHAIN_ID,
+        );
+        let sig = self.signer.sign_hash_sync(&hash)?;
+        // wire v = 27 + y-parity (same normalization as sign_l1_action)
+        let v = match sig.v_byte() {
+            0 | 1 => 27 + sig.v_byte(),
+            other => other,
+        };
+        Ok((
+            hash,
+            SigEnvelope {
+                r: format!("0x{:064x}", sig.r()),
+                s: format!("0x{:064x}", sig.s()),
+                v,
+            },
+        ))
+    }
+
+    /// Recover the signer of a user-signed action digest (audit/test helper; the
+    /// venue does the same ecrecover server-side).
+    pub fn recover_user_signed(hash: B256, sig: &SigEnvelope) -> Result<Address> {
+        let r_hex = sig.r.trim_start_matches("0x");
+        let s_hex = sig.s.trim_start_matches("0x");
+        if r_hex.len() > 64 || s_hex.len() > 64 {
+            bail!("signature r/s must be at most 64 hex chars");
+        }
+        let mut rb = [0u8; 32];
+        let mut sb = [0u8; 32];
+        alloy_primitives::hex::decode_to_slice(r_hex, &mut rb[32 - r_hex.len() / 2..])
+            .map_err(|e| anyhow!("bad signature r hex: {e}"))?;
+        alloy_primitives::hex::decode_to_slice(s_hex, &mut sb[32 - s_hex.len() / 2..])
+            .map_err(|e| anyhow!("bad signature s hex: {e}"))?;
+        let parity = match sig.v {
+            27 => false,
+            28 => true,
+            other => bail!("signature v must be 27 or 28, got {other}"),
+        };
+        let signature = alloy_primitives::Signature::from_scalars_and_parity(
+            B256::from(rb),
+            B256::from(sb),
+            parity,
+        );
+        signature
+            .recover_address_from_prehash(&hash)
+            .map_err(|e| anyhow!("ecrecover failed: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests_user_signed_approve_builder_fee {
+    use super::*;
+    use std::str::FromStr;
+
+    // ----- OFFICIAL SDK VECTOR (hyperliquid-rust-sdk exchange_client.rs
+    // `test_approve_builder_fee_signing`): the SDK's own pinned signatures for
+    // ApproveBuilderFee{signatureChainId:421614, hyperliquidChain, builder,
+    // maxFeeRate:"0.001%", nonce:1583838}. Reproducing them byte-for-byte proves
+    // our hand-encoded EIP-712 domain + struct hash + v encoding match the SDK.
+    const SDK_KEY: &str = "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e";
+    const SDK_BUILDER: &str = "0x1234567890123456789012345678901234567890";
+    const SDK_FEE: &str = "0.001%";
+    const SDK_NONCE: u64 = 1_583_838;
+    const SDK_MAINNET_SIG: &str = "0x343c9078af7c3d6683abefd0ca3b2960de5b669b716863e6dc49090853a4a3cd6c016301239461091a8ca3ea5ac783362526c4d9e9e624ffc563aea93d6ac2391b";
+    const SDK_TESTNET_SIG: &str = "0x2ada43eeebeba9cfe13faf95aa84e5b8c4885c3a07cbf4536f2df5edd340d4eb1ed0e24f60a80d199a842258d5fa737a18d486f7d4e656268b434d226f2811d71c";
+
+    #[test]
+    fn approve_builder_fee_user_signed_matches_official_sdk_vector() {
+        let signer = AgentSigner::from_hex_key(SDK_KEY).unwrap();
+        let builder = Address::from_str(SDK_BUILDER).unwrap();
+        let (_, mainnet) = signer.sign_approve_builder_fee(builder, SDK_FEE, SDK_NONCE, true).unwrap();
+        assert_eq!(
+            mainnet.to_65byte_hex(),
+            SDK_MAINNET_SIG,
+            "mainnet approveBuilderFee signature diverges from hyperliquid-rust-sdk"
+        );
+        let (_, testnet) = signer.sign_approve_builder_fee(builder, SDK_FEE, SDK_NONCE, false).unwrap();
+        assert_eq!(
+            testnet.to_65byte_hex(),
+            SDK_TESTNET_SIG,
+            "testnet approveBuilderFee signature diverges from hyperliquid-rust-sdk"
+        );
+        assert_ne!(mainnet, testnet, "hyperliquidChain must change the signature");
+        // domain sanity: the user-signed domain is NOT the L1 phantom-agent domain
+        assert_ne!(user_signed_domain_separator(HL_SIGNATURE_CHAIN_ID), exchange_domain_separator());
+        assert_eq!(HL_SIGNATURE_CHAIN_ID, 421_614);
+    }
+
+    #[test]
+    fn approve_builder_fee_is_deterministic_and_recovers_signer() {
+        // Fixed key + nonce + builder + fee => stable hash and stable signature.
+        let key = "0x4646464646464646464646464646464646464646464646464646464646464646";
+        let a = AgentSigner::from_hex_key(key).unwrap();
+        let b = AgentSigner::from_hex_key(key).unwrap();
+        let builder = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
+        let nonce: u64 = 1_739_000_000_000;
+        let (h1, s1) = a.sign_approve_builder_fee(builder, "0.02%", nonce, false).unwrap();
+        let (h2, s2) = b.sign_approve_builder_fee(builder, "0.02%", nonce, false).unwrap();
+        assert_eq!(h1, h2, "same inputs must hash identically");
+        assert_eq!(s1, s2, "same key+hash must sign identically (RFC-6979)");
+        assert_eq!(AgentSigner::recover_user_signed(h1, &s1).unwrap(), a.address());
+        // the digest is pinned (guards against silent encoder drift)
+        assert_eq!(
+            format!("{h1:#x}"),
+            "0x40754f0f5bfda2cb39bd7743a1138f12cda5a8db1bb8f26970ca1c5559dda8e0",
+        );
+        // every signed field must move the digest
+        let (h_fee, _) = a.sign_approve_builder_fee(builder, "0.05%", nonce, false).unwrap();
+        let (h_nonce, _) = a.sign_approve_builder_fee(builder, "0.02%", nonce + 1, false).unwrap();
+        let (h_chain, _) = a.sign_approve_builder_fee(builder, "0.02%", nonce, true).unwrap();
+        let other = Address::from_str("0x2222222222222222222222222222222222222222").unwrap();
+        let (h_builder, _) = a.sign_approve_builder_fee(other, "0.02%", nonce, false).unwrap();
+        for (name, h) in [("maxFeeRate", h_fee), ("nonce", h_nonce), ("hyperliquidChain", h_chain), ("builder", h_builder)] {
+            assert_ne!(h, h1, "{name} must change the signing hash");
+        }
+        assert_eq!(max_fee_rate_string(20).unwrap(), "0.02%");
+        assert_eq!(max_fee_rate_string(1).unwrap(), "0.001%");
+        assert_eq!(max_fee_rate_string(100).unwrap(), "0.1%");
+        assert!(max_fee_rate_string(0).is_err());
+        assert!(max_fee_rate_string(101).is_err());
+        assert!(validate_max_fee_rate("0.02%").is_ok());
+        assert!(validate_max_fee_rate("0.02").is_err());
+        assert!(validate_max_fee_rate("0.5%").is_err(), "above the kit cap");
+    }
 }

@@ -212,6 +212,35 @@ impl HlClient {
         Ok(sum)
     }
 
+    /// The SAME position, but SIGNED (long > 0, short < 0), in USD at `mark`.
+    /// The position cap needs the side: from |position| alone a sell against a short
+    /// looks like a reduction and the cap switches off for the order that doubles it,
+    /// while a buy that CLOSES a short looks like it opens one (critic round 4).
+    /// A flat or missing coin is a real 0.0; a missing `szi` is still an error.
+    pub fn position_signed_notional(&self, user: &str, coin: &str, mark: f64) -> Result<f64> {
+        let st = self.clearinghouse_state(user)?;
+        let arr = st
+            .get("assetPositions")
+            .and_then(|a| a.as_array())
+            .ok_or_else(|| anyhow::anyhow!("clearinghouseState: missing assetPositions array"))?;
+        for p in arr {
+            let pos = p.get("position").unwrap_or(p);
+            let c = pos.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+            if c.eq_ignore_ascii_case(coin) {
+                let szi = pos
+                    .get("szi")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .ok_or_else(|| anyhow::anyhow!("clearinghouseState: {coin} position has no readable szi"))?;
+                if !szi.is_finite() {
+                    return Err(anyhow::anyhow!("clearinghouseState: {coin} szi is not finite"));
+                }
+                return Ok(szi * mark);
+            }
+        }
+        Ok(0.0)
+    }
+
     /// The account's perp account value (USD) from the venue: `marginSummary.accountValue`.
     /// The live path seeds the guardrail's equity with this so the leverage cap is a
     /// statement about the real account, not about a number typed into the TOML.

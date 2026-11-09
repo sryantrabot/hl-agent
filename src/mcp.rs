@@ -366,8 +366,11 @@ mod tests {
         fn max_builder_fee(&self, _user: &str, _builder: &str) -> anyhow::Result<u32> {
             Ok(20)
         }
-        fn position_notional(&self, _user: &str, _coin: &str, _mark: f64) -> anyhow::Result<f64> {
+        fn position_signed_notional(&self, _user: &str, _coin: &str, _mark: f64) -> anyhow::Result<f64> {
             Ok(0.0) // flat account
+        }
+        fn account_equity(&self, _user: &str) -> anyhow::Result<f64> {
+            Ok(5_000.0)
         }
         fn realized_pnl_since(&self, _user: &str, _start_ms: i64) -> anyhow::Result<f64> {
             Ok(0.0) // no loss today

@@ -33,12 +33,17 @@ pub struct Ctx {
     /// Current |position| notional for `intent.coin`, if known (None => the caller
     /// applies the position cap itself, as product's simulator does pre-swap).
     pub position_notional: Option<f64>,
+    /// The SAME position with its SIGN (long > 0, short < 0) when the caller knows it.
+    /// Without the sign, a sell against a SHORT reads as a "reduction" and the position
+    /// cap switches off for the order that doubles the short (critic round 4, 2026-11-09).
+    /// None => sign unknown; the absolute branch is used (conservative for longs only).
+    pub position_signed: Option<f64>,
 }
 
 impl Ctx {
     /// Product-stub-compatible 2-field context (position cap enforced by caller).
     pub fn simple(now_ms: i64, mark: Option<f64>) -> Self {
-        Self { now_ms, mark, position_notional: None }
+        Self { now_ms, mark, position_notional: None, position_signed: None }
     }
 }
 
@@ -163,22 +168,45 @@ impl Guardrail {
                     }
                 }
             };
-            // A sell only REDUCES when it does not flip the position. Treating every sell on a
-            // long as a reduce (as this used to) let a sell 10x the position open a huge
-            // short with the position cap switched off. A flip is judged by its size, so
-            // the |position after| branch below is what has to run.
-            let reducing = pos > 0.0 && !intent.is_buy && intent.size * mark <= pos + 1e-9;
-            let is_reduce = intent.reduce_only || reducing;
-            if !is_reduce {
-                let worst = if intent.is_buy { pos + intent.size * mark } else { (pos - intent.size * mark).abs() };
-                if worst > self.cfg.max_position_notional_usd + 1e-9 {
+            // SIGNED position when the caller knows the side (critic round 4, 2026-11-09):
+            // without the sign a SELL against a SHORT reads as a "reduction" and the cap
+            // switches off for the order that doubles the short, while a BUY that CLOSES
+            // a short reads as if it opened one and can block the user's own exit.
+            // `pos` is |position| notional; `signed_before` is the same with its sign.
+            let signed_before = match ctx.position_signed {
+                Some(s) if s.is_finite() => s,
+                Some(s) => {
                     return Decision::Reject {
-                        reason: format!(
-                            "position cap: |position after| {worst:.2} USD > max_position_notional {:.2}",
-                            self.cfg.max_position_notional_usd
-                        ),
-                    };
+                        reason: format!("position_signed must be finite and signed (long > 0, short < 0), got {s}"),
+                    }
                 }
+                None => pos,
+            };
+            // The notional this order can actually create is priced at the WORST of the
+            // mark and the signed limit, never at the mid alone: a $500 "order cap" was
+            // bypassable by signing a buy at limit 200_000 against a 2_000 mid (critic
+            // round 4, item 3). Over-counting a resting order is the safe direction.
+            let px = match intent.limit_price {
+                Some(l) if l.is_finite() && l > 0.0 => l.max(mark),
+                _ => mark,
+            };
+            let signed_size = if intent.is_buy { intent.size * px } else { -(intent.size * px) };
+            let after = signed_before + signed_size;
+            // The cap is about the position AFTER the order. An order that shrinks
+            // |position| can never breach it, so it is allowed even on an account that is
+            // already above the cap (never block an exit); anything else is judged by
+            // |position after|, which is what catches a flip and a short-doubling sell.
+            let shrinking = after.abs() < signed_before.abs() - 1e-9;
+            if after.abs() > self.cfg.max_position_notional_usd + 1e-9 && !shrinking {
+                return Decision::Reject {
+                    reason: format!(
+                        "position cap: |position after| {:.2} USD > max_position_notional {:.2} (position {:.2} -> {:.2})",
+                        after.abs(),
+                        self.cfg.max_position_notional_usd,
+                        signed_before,
+                        after
+                    ),
+                };
             }
         }
 
@@ -231,7 +259,14 @@ impl Guardrail {
             if !(mark.is_finite() && mark > 0.0) {
                 return Decision::Reject { reason: format!("mark must be finite and > 0, got {mark}") };
             }
-            let notional = intent.size * mark;
+            // Priced at the WORST of the mark and the signed limit: a $500 order cap was
+            // bypassable by signing a buy at limit 200_000 against a 2_000 mid (critic
+            // round 4, item 3 — a limit/IoC price is the only protection the kit has).
+            let px = match intent.limit_price {
+                Some(l) if l.is_finite() && l > 0.0 => l.max(mark),
+                _ => mark,
+            };
+            let notional = intent.size * px;
             if notional > self.cfg.max_order_notional_usd + 1e-9 {
                 return Decision::Reject {
                     reason: format!("order notional {notional:.2} USD > cap {:.2}", self.cfg.max_order_notional_usd),

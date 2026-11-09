@@ -92,10 +92,14 @@ Response carries `guardrail_decision` (`allow`/`reject` + reason), `fill_status`
 
 All caps live in one TOML file (see `examples/guardrail.example.toml`):
 
-- **position cap** — max |position| notional per coin (USD), checked against your account's
-  real position read from the venue on every live order
-- **order cap** — max single-order notional (USD)
-- **leverage cap** — order notional ≤ `max_leverage` × `account_equity_usd`
+- **position cap** — max |position| notional per coin (USD), judged on the position AFTER the
+  order using the venue's own signed position on every live order: a sell against a short is
+  not treated as a "reduction", and an order that shrinks your position is never blocked
+- **order cap** — max single-order notional (USD), priced at the worse of the mark and the
+  limit price you sign (a limit far above the mid cannot sneak past the cap)
+- **leverage cap** — order notional ≤ `max_leverage` × your account's real equity, read from
+  the venue before every live order (the `account_equity_usd` in the TOML is the simulator's
+  assumption only)
 - **daily loss cap** — stops for the UTC day once realized PnL ≤ −cap; on live orders the
   PnL comes from the venue's own fills since UTC midnight, not from a counter in this process
 - **loop tripwire** — rejects N near-identical orders inside a sliding window (stuck-loop

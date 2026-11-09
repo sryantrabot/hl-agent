@@ -1,4 +1,4 @@
-//! Builder-fee approval + verification, testnet by default (the signed-order section of this README).
+//! Builder-fee approval + verification, testnet by default (specs/hl-agent.md Week 2).
 //!
 //! This is the USER'S step in the kit's trust flow, written as a runnable example:
 //! the user's MAIN wallet signs ONE `approveBuilderFee` action (max fee you allow
@@ -9,9 +9,17 @@
 //! After approving, it checks the approval landed: `maxBuilderFee(user, builder)`
 //! should return the fee you set (0 = no active approval).
 //!
+//! The action is a USER-SIGNED EIP-712 transaction, exactly as both official SDKs do it
+//! (`sign_approve_builder_fee` / `ExchangeClient::approve_builder_fee`): domain
+//! "HyperliquidSignTransaction", version "1", chainId 0x66eee (421614),
+//! verifyingContract 0x0; primary type
+//! "HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,
+//! address builder,uint64 nonce)". The POSTed action therefore carries 6 fields
+//! (type, maxFeeRate, builder, hyperliquidChain, signatureChainId, nonce).
+//!
 //! Usage:
-//!   cargo run -p hl-agent --example approve_builder_fee -- <main-wallet-hex-key> \
-//!       <builder-address> [fee_tenths_bp] [--mainnet]
+//!   HL_MAIN_KEY=0x... cargo run -p hl-agent --example approve_builder_fee -- \
+//!       [builder-address] [fee_tenths_bp] [--mainnet]
 //!
 //! The key is read from HL_MAIN_KEY only (never argv: it would land in your shell
 //! history and `ps`), used in memory only, never logged. MAINNET requires
@@ -70,6 +78,11 @@ fn main() -> anyhow::Result<()> {
     let client = ExchangeClient::new(base, signer);
 
     // 3. Approve: one action, max fee per fill = fee_tenths_bp tenths of bp.
+    //    The unsigned action is printed FIRST so the operator can audit exactly what
+    //    the signature will cover (it is the EIP-712 message; no key material inside).
+    let action_preview =
+        hl_agent::ExchangeClient::approve_builder_fee_action(&builder_addr, fee_tenths_bp, nonce, mainnet)?;
+    println!("[3/4] signing + POSTing action: {action_preview}");
     let resp = client.approve_builder_fee(&builder_addr, fee_tenths_bp, nonce, mainnet)?;
     println!("[3/4] approveBuilderFee response: {}", resp.raw);
     if !resp.is_ok() {
