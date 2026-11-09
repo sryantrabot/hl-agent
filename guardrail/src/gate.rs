@@ -1,4 +1,6 @@
 //! The pre-trade gate: `allow(intent, ctx) -> Decision`, called BEFORE any signing.
+//! Ported 1:1 from products/hl-agent/src/guardrail.rs (product's week-1 stub) so the
+//! engine swap is drop-in: same field names, same rejection order, same reasons.
 use serde::{Deserialize, Serialize};
 
 use crate::config::GuardrailConfig;
@@ -117,6 +119,17 @@ impl Guardrail {
 
     pub fn realized_pnl_today(&self) -> f64 {
         self.realized_pnl_today_usd
+    }
+
+    /// REPLACE today's realized PnL with an authoritative figure from the venue.
+    /// Use this (not `record_realized_pnl`) when re-reading the source of truth: the
+    /// venue's number already contains every earlier call, so accumulating it twice
+    /// would inflate the daily loss and block orders that should be allowed.
+    pub fn set_realized_pnl_today(&mut self, pnl_usd: f64, now_ms: i64) {
+        self.on_clock(now_ms);
+        if pnl_usd.is_finite() {
+            self.realized_pnl_today_usd = pnl_usd;
+        }
     }
 
     /// The pre-trade gate. Rejection order: intent sanity -> daily loss -> rate limit ->

@@ -1,7 +1,6 @@
-//! Exchange client (week 2, specs/hl-agent.md §Week 2): the OPTIONAL signed path.
+//! Exchange client (the optional signed path): the OPTIONAL signed path.
 //! POSTs ONE signed action to `{base}/exchange` and parses the venue's
 //! `{status:"ok"}` / `{status:"err", response:<text>}` envelope. NO retry loop —
-//! Hyperliquid's nonce window makes blind replays dangerous (see knowledge/intel/
 //! 2026-11-05-agent-pain/hl-builder-codes.md: one API wallet per process, T-2d..T+1d).
 //!
 //! SAFETY LAWS (dispatch): no live keys in this repo, no mainnet POSTs from tests,
@@ -44,8 +43,7 @@ impl OrderWire {
     }
 }
 
-/// Docs-faithful builder-fee validation (knowledge/intel/2026-11-05-agent-pain/
-/// hl-builder-codes.md): f is tenths of bp; caps 10 bp (f<=100) enforced conservatively
+/// Docs-faithful builder-fee validation : f is tenths of bp; caps 10 bp (f<=100) enforced conservatively
 /// for perps AND spot; builder codes "do not apply to the buying side of spot trades".
 pub fn validate_builder_fee(fee_tenths_bp: u32, order: &OrderWire) -> Result<()> {
     if fee_tenths_bp > 100 {
@@ -147,6 +145,22 @@ impl ExchangeClient {
         self.post_body(body)
     }
 
+    /// Sign `action` once and POST it once, returning BOTH the signed body (the
+    /// user's audit trail) and the parsed venue answer. Used by the live-order
+    /// path; no retry, ever (nonce window).
+    pub fn sign_and_post_action(
+        &self,
+        action: &HlOrderAction,
+        nonce: u64,
+        is_mainnet: bool,
+    ) -> Result<(serde_json::Value, ExchangeResponse)> {
+        let mp = action.to_msgpack()?;
+        let (_, sig) = self.signer.sign_l1_action(&mp, nonce, None, is_mainnet)?;
+        let body = Self::envelope(action.to_json(), nonce, &sig);
+        let resp = self.post_body(body.clone())?;
+        Ok((body, resp))
+    }
+
     /// Place ONE order with our builder code attached. Validates the fee BEFORE
     /// signing; the user's main wallet must have approved the builder
     /// (ApproveBuilderFee, one-time, revocable) or the venue rejects. Mainnet is
@@ -176,7 +190,25 @@ impl ExchangeClient {
         self.post_body(body)
     }
 
+    /// Like `sign_and_post_action`, but NEVER throws away the signed body: when the
+    /// POST itself fails (timeout, 5xx, connection reset) we cannot know whether the
+    /// venue received it, and the caller must tell the user to check open orders
+    /// before retrying — a blind retry with a fresh nonce double-fills.
+    pub fn sign_and_post_audited(
+        &self,
+        action: &HlOrderAction,
+        nonce: u64,
+        is_mainnet: bool,
+    ) -> Result<(serde_json::Value, anyhow::Result<ExchangeResponse>)> {
+        let mp = action.to_msgpack()?;
+        let (_, sig) = self.signer.sign_l1_action(&mp, nonce, None, is_mainnet)?;
+        let body = Self::envelope(action.to_json(), nonce, &sig);
+        let posted = self.post_body(body.clone());
+        Ok((body, posted))
+    }
+
     fn post_body(&self, body: Value) -> Result<ExchangeResponse> {
+
         let url = format!("{}/exchange", self.base);
         let resp = self.http.post(&url).json(&body).send()?;
         let status = resp.status();

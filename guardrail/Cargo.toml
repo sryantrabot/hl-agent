@@ -3,11 +3,10 @@ name = "guardrail"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Pure guardrail engine for trading agents: TOML caps config, pre-trade gate allow(intent)->Decision, loop tripwire, deterministic fill classifier (FILLED/PARTIAL/FAILED/UNKNOWN), idempotency book + retry-with-backoff helper. NO network, NO keys, NO clock reads, NO threads - every decision is a pure function of (config, intent, caller-supplied context)."
+description = "Pure guardrail engine for trading agents: TOML caps config, pre-trade gate allow(intent)->Decision, loop tripwire, deterministic fill classifier (FILLED/PARTIAL/FAILED/UNKNOWN), idempotency book + retry-with-backoff helper. NO network, NO keys, NO clock reads, NO threads — every decision is a pure function of (config, intent, caller-supplied context)."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-
 toml = "0.8"
 
 [dev-dependencies]

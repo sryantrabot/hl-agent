@@ -1,11 +1,13 @@
 //! Dry-run order simulator: intent -> guardrail gate -> simulated fill.
 //! NO network order placement, NO keys, NO signing — the simulator only mutates its own
-//! in-memory book. The fill-check step sits behind a trait so the bundled\n//! guardrail engine can drop in without touching callers.
+//! in-memory book. The fill-check step sits behind a trait so tech's real engine
+//! (crates/guardrail, this README Week 1 tech) can drop in without touching callers.
 use crate::guardrail::{Ctx, Decision, Guardrail, OrderIntent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Fill outcome for an accepted order: FILLED in the dry-run simulator; the\n/// guardrail engine's deterministic fill-check (FILLED/PARTIAL/FAILED/UNKNOWN)\n/// can replace it.
+/// Fill outcome. Week 1: the stub always reports FILLED for accepted orders; the real
+/// engine's fill-check (FILLED/PARTIAL/FAILED/UNKNOWN, deterministic) replaces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FillStatus {
@@ -20,9 +22,10 @@ pub trait FillCheck: Send {
     fn check(&self, fill: &SimFill) -> FillStatus;
 }
 
-/// Default fill-check: every gated order simulates as FILLED at the mark (or the
-/// limit). This keeps the dry-run simulator the default path; the deterministic
-/// offline classifier below can replace it.
+/// Week-1 default: every gated order simulates as FILLED at the mark (or the limit).
+/// Kept as the DryRunSimulator default in week 2 (the simulator path stays the default;
+/// see README "Week 2"). Renamed from `FillCheckStub` in week 2 so that name can carry
+/// the deterministic offline classifier below.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AlwaysFillStub;
 
@@ -32,7 +35,9 @@ impl FillCheck for AlwaysFillStub {
     }
 }
 
-/// Deterministic OFFLINE fill-check (the engine's venue classifier needs a venue\n/// response — this one runs with no network and no venue at all):
+/// Week-2 deterministic OFFLINE fill-check (the signed-order section of this README; the engine's
+/// venue classifier lives in crates/guardrail/src/fill.rs and needs a venue response —
+/// this stub runs with no network and no venue at all):
 /// - market order with a mark, or a limit order CROSSING the mark (buy limit >= mark,
 ///   sell limit <= mark) -> FILLED (at the limit price, matching the simulator's
 ///   execution-price convention);
@@ -227,7 +232,7 @@ impl DryRunSimulator {
         }
 
         // Simulated fill: market orders fill at the mark; limit orders at the limit price
-        // (the dry-run simulator does not model queueing/partial fills — documented in README).
+        // (week-1 stub does not model queueing/partial fills — documented in README).
         let price = match (intent.limit_price, mark) {
             (Some(px), _) => px,
             (None, Some(m)) => m,

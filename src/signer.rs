@@ -1,9 +1,8 @@
-//! Agent signer (week 2, specs/hl-agent.md §Week 2): turns a Hyperliquid API-wallet
+//! Agent signer (the optional signed path): turns a Hyperliquid API-wallet
 //! private key into signatures over exchange (L1) action envelopes. The key lives ONLY
 //! in process memory — never read from .env or disk, never logged.
 //!
-//! VERIFIED-CONSTRUCTION 2026-11-05 (ceo/product run #131; supersedes the run-128
-//! run-128 best-spec pin): fetched live from the official SDKs —
+//! Signature construction is VERIFIED against the official SDKs (fetched live):
 //!   - hyperliquid-dex/hyperliquid-rust-sdk @ master:
 //!       src/exchange/exchange_client.rs  `Actions::hash`  (msgpack + nonce + vault flag)
 //!       src/signature/agent.rs           `l1::Agent`      (EIP-712 domain + struct)
@@ -213,14 +212,19 @@ impl HlOrderAction {
     }
 
     /// The JSON body for the POST (key order irrelevant — the venue parses JSON; the
-    /// SIGNATURE is over the msgpack form, not this).
+    /// SIGNATURE is over the msgpack form, not this). `builder` is OMITTED exactly
+    /// when it is absent from the msgpack form: sending `"builder": null` is a
+    /// different action than sending no builder, so the two must never drift.
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "type": "order",
             "orders": self.orders,
             "grouping": self.grouping,
-            "builder": self.builder,
-        })
+        });
+        if let Some(b) = &self.builder {
+            v["builder"] = serde_json::json!({ "b": b.b, "f": b.f });
+        }
+        v
     }
 }
 
@@ -565,8 +569,7 @@ mod tests {
 }
 
 // ---------- ApproveBuilderFee (the one-time, revocable main-wallet approval) ----------
-// Wire truth (knowledge/intel/2026-11-05-agent-pain/hl-builder-codes.md, docs verified
-// live 2026-11-04): the approval is an EXCHANGE L1 action {"type":"approveBuilderFee",
+// Wire truth : the approval is an EXCHANGE L1 action {"type":"approveBuilderFee",
 // "maxFeeRate": "<f> tenths of bp as a decimal string", "builder": "0x…"}, signed by the
 // USER'S MAIN WALLET — an API/agent wallet CANNOT approve (sign-only by design). One
 // approval per builder, max 10 active per user, revocable any time. `maxFeeRate` mirrors

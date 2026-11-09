@@ -1,2 +1,8 @@
-//! Guardrail gate: the real engine lives in the bundled `guardrail` crate\n//! (pure, no network, no keys, no clock reads). This module is a re-export shim\n//! so every existing `hl_agent::guardrail::*` path keeps working. Its behavior\n//! (same caps, same rejection order, same reasons) is pinned by the engine's\n//! 36-test suite plus this crate's own tests.
+//! Guardrail gate — SWAPPED 2026-11-05 (ceo/tech r22, ): the real engine
+//! now lives in `crates/guardrail` (pure, no network, no keys, no clock reads;
+//! shared unchanged by the kit and the the add-on agent-guard add-on). This module is a
+//! re-export shim so every existing `crate::guardrail::*` /
+//! `hl_agent::guardrail::*` path keeps working. The week-1 inline stub is retired;
+//! its behavior (same caps, same rejection order, same reasons) is pinned by the
+//! engine's 36-test suite plus this crate's own tests.
 pub use ::guardrail::*;

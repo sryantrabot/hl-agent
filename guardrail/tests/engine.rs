@@ -1,4 +1,4 @@
-//! guardrail engine acceptance tests.
+//! guardrail engine acceptance tests (this README Week 1 tech).
 //! Everything runs through the PUBLIC API only: config TOML, allow() gate,
 //! fill classification, idempotency book, retry helper.
 use guardrail::{

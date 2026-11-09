@@ -8,7 +8,8 @@
 //! `on_wait` callback.
 use serde::{Deserialize, Serialize};
 
-/// A fill outcome, venue-shaped (SCREAMING_SNAKE_CASE, matching the top-level\n/// crate's `FillStatus` so swaps stay mechanical).
+/// A fill outcome, venue-shaped (SCREAMING_SNAKE_CASE to match product's
+/// `FillStatus` so the week-2 swap of `FillCheckStub` stays mechanical).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FillStatus {

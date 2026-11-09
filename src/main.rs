@@ -4,7 +4,13 @@
 //!   --base <url>      Hyperliquid API base (default: mainnet public API)
 //!   --testnet         use https://api.hyperliquid-testnet.xyz
 //!   --check-config    validate the guardrail TOML and exit 0/2 (no server)
-//! NO key flag exists: week 1 never signs anything.
+//!   --live            ENABLE the live-order tool (place_order_live). OFF by default: without
+//!                     this flag the process holds no key and no signing code runs at all.
+//!   --user <0x...>    the account the orders trade for (your MAIN wallet address); required by --live
+//!   --builder <0x...> builder address to attach after YOUR approval (default: the kit maintainer's)
+//!   --fee-tenths-bp N our builder fee, 1..=100 tenths of a bp (default 10 = 1 bp)
+//! The agent key is NEVER a flag: --live reads it from the HL_AGENT_KEY environment variable only,
+//! so it cannot land in argv, shell history or a process list.
 use hl_agent::guardrail::Guardrail;
 use hl_agent::mcp::Server;
 use hl_agent::sim::DryRunSimulator;
@@ -15,6 +21,10 @@ fn main() {
     let mut config: Option<String> = None;
     let mut base: Option<String> = None;
     let mut check_only = false;
+    let mut live = false;
+    let mut user: Option<String> = None;
+    let mut builder: Option<String> = None;
+    let mut fee_tenths_bp: u32 = 20;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -28,6 +38,22 @@ fn main() {
             }
             "--testnet" => base = Some(TESTNET.into()),
             "--check-config" => check_only = true,
+            "--live" => live = true,
+            "--user" => {
+                i += 1;
+                user = Some(args.get(i).cloned().unwrap_or_else(|| die("--user needs a 0x address")));
+            }
+            "--builder" => {
+                i += 1;
+                builder = Some(args.get(i).cloned().unwrap_or_else(|| die("--builder needs a 0x address")));
+            }
+            "--fee-tenths-bp" => {
+                i += 1;
+                let raw = args.get(i).cloned().unwrap_or_else(|| die("--fee-tenths-bp needs a number"));
+                fee_tenths_bp = raw
+                    .parse()
+                    .unwrap_or_else(|_| die("--fee-tenths-bp must be an integer 1..=100 (tenths of a basis point)"));
+            }
             other => die(&format!("unknown flag: {other} (see --help in README.md)")),
         }
         i += 1;
@@ -52,17 +78,96 @@ fn main() {
     }
 
     let base_url = base.unwrap_or_else(|| MAINNET.into());
-    eprintln!("hl-agent: serving MCP over stdio; api={base_url}; simulate_order={}", if config.is_some() { "enabled" } else { "disabled (no --config)" });
     let hl = HlClient::new(&base_url);
-    let sim = config.map(|_| DryRunSimulator::new(Guardrail::new(cfg)));
+    let sim = config
+        .as_ref()
+        .map(|_| DryRunSimulator::new(Guardrail::new(cfg.clone())));
     let mut server = Server::new(hl, sim);
+    if live {
+        // Build the live path FIRST: a bad key or a missing --user must exit before
+        // we print "serving", so a user never sees a server that cannot do the job.
+        server = server.with_live(build_live(&base_url, cfg, user, builder, fee_tenths_bp));
+    }
+    eprintln!(
+        "hl-agent: serving MCP over stdio; api={base_url}; simulate_order={}; place_order_live={}",
+        if config.is_some() { "enabled" } else { "disabled (no --config)" },
+        if live { "ENABLED" } else { "off (start with --live to sign)" }
+    );
+
     if let Err(e) = server.serve() {
         eprintln!("hl-agent: stdio loop ended: {e}");
         std::process::exit(1);
     }
 }
 
+/// The kit maintainer's builder address. Fee income for the project; attached only
+/// after the user's own main wallet approves it on the venue (revocable any time).
+const DEFAULT_BUILDER: &str = "0x5a229a20D9636a07583D6868FABf4B2903271Ab7";
+
+/// Build the live-order path. Every requirement is checked HERE, before the server
+/// takes a single request: a misconfigured --live exits 2 with one sentence instead
+/// of failing after a user's order was already in flight.
+///
+/// The agent key comes from HL_AGENT_KEY only (never argv, never a file this kit
+/// writes). It is a Hyperliquid API wallet key: sign-only, cannot withdraw, cannot
+/// approve anything. `--user` is the MAIN wallet whose account the orders trade for;
+/// the venue compares the two, so a wrong pair fails on the first order with a clear
+/// error instead of silently trading the wrong account.
+fn build_live(
+    base_url: &str,
+    cfg: hl_agent::guardrail::GuardrailConfig,
+    user: Option<String>,
+    builder: Option<String>,
+    fee_tenths_bp: u32,
+) -> Box<dyn hl_agent::live::LiveTool> {
+    let user = user.unwrap_or_else(|| {
+        die("--live needs --user <your MAIN wallet 0x address>: the account your agent key trades for")
+    });
+    if !user.starts_with("0x") || user.len() != 42 {
+        die(&format!("--user looks wrong ({user}): expected a 42-character 0x address"));
+    }
+    if !(1..=100).contains(&fee_tenths_bp) {
+        die(&format!("--fee-tenths-bp {fee_tenths_bp} is outside 1..=100 (0.1 to 10 bp); the venue caps perps at 10 bp"));
+    }
+    let key = std::env::var("HL_AGENT_KEY").unwrap_or_else(|_| {
+        die("--live needs HL_AGENT_KEY in the environment (your Hyperliquid API-wallet key). It is never read from a flag, a file or .env by this kit.")
+    });
+    let signer = hl_agent::AgentSigner::from_hex_key(&key)
+        .unwrap_or_else(|e| die(&format!("HL_AGENT_KEY is not a usable key: {e}")));
+    // Default builder: the kit maintainer's address, so a user who follows the README
+    // earns us the fee we ask for. It only ever RIDES on an order after the venue
+    // reports the user approved us — no approval, no builder field, order unaffected.
+    let builder = builder
+        .or_else(|| std::env::var("HL_BUILDER_ADDRESS").ok())
+        .or_else(|| Some(DEFAULT_BUILDER.to_string()));
+
+    let is_mainnet = base_url == MAINNET;
+    if is_mainnet && std::env::var("HL_ALLOW_MAINNET").is_err() {
+        die("mainnet orders need HL_ALLOW_MAINNET set in the environment. Start on --testnet with a throwaway key.");
+    }
+    let ex = hl_agent::ExchangeClient::new(base_url, signer);
+    let venue = hl_agent::HlVenue { hl: HlClient::new(base_url), ex };
+    let live_cfg = hl_agent::LiveConfig {
+        user,
+        builder: builder.clone(),
+        fee_tenths_bp,
+        is_mainnet,
+    };
+    let gate = Guardrail::new(cfg);
+    eprintln!(
+        "hl-agent: LIVE ORDER PATH ARMED on {}; builder fee {} tenths of a bp; guardrail caps run before every signature",
+        if is_mainnet { "MAINNET" } else { "testnet" },
+        fee_tenths_bp
+    );
+    match &builder {
+        Some(b) => eprintln!("hl-agent: builder {b} — attaches only if your main wallet approved a fee >= {fee_tenths_bp} on the venue (examples/approve_builder_fee.rs)"),
+        None => eprintln!("hl-agent: NO builder address configured — orders carry no builder fee"),
+    }
+    Box::new(hl_agent::LiveTrader::new(venue, live_cfg, gate))
+}
+
 fn die(msg: &str) -> ! {
+
     eprintln!("hl-agent error: {msg}");
     std::process::exit(2);
 }

@@ -1,4 +1,9 @@
-//! Builder approval-flow end-to-end example on Hyperliquid TESTNET.\n//!\n//! Run it MANUALLY with your own testnet API-wallet key, after our builder\n//! address is funded on testnet. Manual gate on purpose: this is the first\n//! signed order the kit ever places; an agent must not run it unattended.
+//! End-to-end check of the builder approval flow on Hyperliquid TESTNET.
+//!
+//! NEEDS a funded builder address (Hyperliquid requires a builder to hold at least
+//! 100 USDC perp account value before it can collect fees) and your own testnet
+//! API-wallet key. Run it ONLY after that, manually: an agent must not run it
+//! unattended.
 //!
 //! It signs one IOC limit order (0.005 HYPE @ $20, far from any resting order),
 //! attaches OUR builder code {b: <BUILDER_ADDRESS>, f: 20} (2 bp), POSTs to the

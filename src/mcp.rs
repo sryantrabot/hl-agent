@@ -4,6 +4,7 @@
 //! three request shapes and one notification (spec: modelcontextprotocol.io).
 //! ALL stdout writes are protocol frames; logs go to stderr only.
 use crate::guardrail::GuardrailConfig;
+use crate::live::LiveTool;
 use crate::sim::{DryRunSimulator, FillStatus};
 use crate::HlClient;
 use serde_json::{json, Value};
@@ -16,9 +17,12 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Server {
     hl: HlClient,
     sim: Option<DryRunSimulator>,
+    /// The live-order path, when the operator enabled it (--live). None in the
+    /// default dry-run server: then no key exists in this process at all.
+    live: Option<Box<dyn LiveTool>>,
 }
-
 fn tool_spec(name: &str, description: &str, props: Value, required: &[&str]) -> Value {
+
     json!({
         "name": name,
         "description": description,
@@ -32,11 +36,16 @@ fn tool_spec(name: &str, description: &str, props: Value, required: &[&str]) -> 
 
 impl Server {
     pub fn new(hl: HlClient, sim: Option<DryRunSimulator>) -> Self {
-        Self { hl, sim }
+        Self { hl, sim, live: None }
     }
-
+    /// Attach the live-order path (operator-only: `--live`). The server otherwise
+    /// has no signer in the process at all.
+    pub fn with_live(mut self, live: Box<dyn LiveTool>) -> Self {
+        self.live = Some(live);
+        self
+    }
     fn tools_list(&self) -> Value {
-        let tools = vec![
+        let mut tools = vec![
             tool_spec(
                 "hl_meta",
                 "Hyperliquid perp universe (READ-ONLY, public REST): coin names, size decimals, max leverage, delisted flag.",
@@ -74,8 +83,28 @@ impl Server {
                 }),
                 &["coin", "side", "size"],
             ),
+
         ];
+        // The live tool is advertised ONLY when the process actually holds a
+        // signer (operator passed --live). A dry-run server must not offer a
+        // tool it cannot run: an agent host lists tools and trusts the list.
+        if self.live.is_some() {
+            tools.push(tool_spec(
+                "place_order_live",
+                "PLACES A REAL ORDER on Hyperliquid, signed with YOUR OWN agent (API) wallet key. The guardrail caps run BEFORE the signature exists: a rejected order is never signed and never sent. The order is a LIMIT order (send tif=Ioc at the price you accept for an immediate fill). Our builder fee rides along ONLY if your main wallet already approved it on the venue; otherwise the order goes out with no builder field at all, and the response says so. Returns the venue's own fill receipt (FILLED / RESTING / NOT FILLED) plus the signed body for your audit trail. No retry is ever made.",
+                json!({
+                    "coin": {"type": "string", "description": "e.g. BTC"},
+                    "side": {"type": "string", "enum": ["buy", "sell"]},
+                    "size": {"type": "number", "description": "base-asset size (coin units), > 0; rounded DOWN to the venue's size decimals"},
+                    "limit_price": {"type": "number", "description": "REQUIRED: limit price; use a price you accept (market orders are not signable in this kit version)"},
+                    "tif": {"type": "string", "enum": ["Gtc", "Ioc", "Alo"], "description": "default Ioc (fill immediately or cancel)"},
+                    "reduce_only": {"type": "boolean", "description": "default false; true only closes an existing position"}
+                }),
+                &["coin", "side", "size", "limit_price"],
+            ));
+        }
         json!({ "tools": tools })
+
     }
 
     fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
@@ -150,6 +179,17 @@ impl Server {
                     "position_after": res.position_after,
                     "realized_pnl_today_usd": res.realized_pnl_today_usd,
                 }))
+            }
+            "place_order_live" => {
+                let live = self
+                    .live
+                    .as_mut()
+                    .ok_or("place_order_live unavailable: the server was started without --live, so no signing key exists in this process. Run simulate_order, or start with --live and HL_AGENT_KEY set (see README).")?;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                live.place_json(args, now_ms)
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -278,6 +318,121 @@ mod tests {
         assert_eq!(names, vec!["hl_meta", "hl_allmids", "hl_candles", "simulate_order"]);
         // every tool carries a JSON-Schema inputSchema
         assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object"));
+    }
+
+    /// The dry-run server must not advertise a tool it cannot run. An agent host
+    /// lists tools and trusts that list: advertising place_order_live with no
+    /// signer in the process makes the host offer users a live trade that can
+    /// only fail.
+    #[test]
+    fn live_tool_is_absent_without_a_live_path() {
+        let mut s = server_with_sim();
+        let resp = s.handle_line(r#"{"jsonrpc":"2.0","id":20,"method":"tools/list"}"#).unwrap();
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"place_order_live"), "dry-run server advertised the live tool: {names:?}");
+        // and calling it anyway is a TOOL error naming the fix, not a protocol error
+        let resp = s
+            .handle_line(r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"place_order_live","arguments":{"coin":"ETH","side":"buy","size":0.01,"limit_price":2000.0}}}"#)
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let msg = resp["result"]["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(msg.contains("--live"), "error must name the flag that enables it: {msg}");
+    }
+
+    /// Through the REAL JSON-RPC boundary: the live tool refuses an order the
+    /// guardrail rejects, and the venue's sign counter stays at zero. This is the
+    /// money law of the kit, tested where a user's agent actually calls it.
+    /// Test venue: the REAL LiveTrader and the REAL guardrail engine run above it;
+    /// only the network/signing hop is faked, so a pass here means the production
+    /// code path refuses before any signature exists.
+    struct NoSignVenue {
+        sign_calls: std::cell::RefCell<u32>,
+    }
+    impl crate::live::Venue for NoSignVenue {
+        fn mark(&self, _coin: &str) -> anyhow::Result<Option<f64>> {
+            Ok(Some(2000.0))
+        }
+        fn asset_index(&self, _coin: &str) -> anyhow::Result<u32> {
+            Ok(1)
+        }
+        fn size_decimals(&self, _coin: &str) -> anyhow::Result<u32> {
+            Ok(2)
+        }
+        fn max_builder_fee(&self, _user: &str, _builder: &str) -> anyhow::Result<u32> {
+            Ok(20)
+        }
+        fn position_notional(&self, _user: &str, _coin: &str, _mark: f64) -> anyhow::Result<f64> {
+            Ok(0.0) // flat account
+        }
+        fn realized_pnl_since(&self, _user: &str, _start_ms: i64) -> anyhow::Result<f64> {
+            Ok(0.0) // no loss today
+        }
+        fn sign_and_post_audited(
+            &self,
+            action: &crate::signer::HlOrderAction,
+            nonce: u64,
+            _is_mainnet: bool,
+        ) -> anyhow::Result<(Value, anyhow::Result<crate::exchange::ExchangeResponse>)> {
+            *self.sign_calls.borrow_mut() += 1;
+            let body = json!({ "action": action.to_json(), "nonce": nonce });
+            Ok((
+                body,
+                Ok(crate::exchange::ExchangeResponse {
+                    status: "ok".into(),
+                    response: json!({"data": {"statuses": [{"filled": {"totalSz": "0.01", "avgPx": "2000.0", "oid": 1}}]}}),
+                    raw: "{}".into(),
+                }),
+            ))
+        }
+    }
+
+    #[test]
+    fn live_tool_through_jsonrpc_refuses_to_sign_when_a_guardrail_fails() {
+        let venue = NoSignVenue { sign_calls: std::cell::RefCell::new(0) };
+        let trader = crate::live::LiveTrader::new(
+            venue,
+            crate::live::LiveConfig {
+                user: "0x2222222222222222222222222222222222222222".into(),
+                builder: Some("0x1111111111111111111111111111111111111111".into()),
+                fee_tenths_bp: 20,
+                is_mainnet: false,
+            },
+            crate::guardrail::Guardrail::new(crate::guardrail::GuardrailConfig {
+                max_position_notional_usd: 10_000.0,
+                max_order_notional_usd: 50.0,
+                max_leverage: 1.0,
+                account_equity_usd: 5_000.0,
+                daily_loss_cap_usd: 50.0,
+                max_similar_actions: 5,
+                loop_window_seconds: 60,
+                max_calls_per_hour: 100,
+            }),
+        );
+        let mut s = server_with_sim().with_live(Box::new(trader));
+        // tools/list now carries the live tool
+        let resp = s.handle_line(r#"{"jsonrpc":"2.0","id":22,"method":"tools/list"}"#).unwrap();
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"place_order_live"), "live server must advertise the live tool: {names:?}");
+        // an oversized order is rejected by the gate: nothing is signed, nothing sent
+        let resp = s
+            .handle_line(r#"{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"place_order_live","arguments":{"coin":"ETH","side":"buy","size":50.0,"limit_price":2000.0}}}"#)
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], false, "a guardrail rejection is a decision, not a tool error");
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["outcome"], "rejected");
+        assert_eq!(sc["signed"], false);
+        assert_eq!(sc["sent"], false);
+        assert!(sc["reason"].as_str().unwrap().contains("guardrail"));
     }
 
     #[test]

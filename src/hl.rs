@@ -1,6 +1,6 @@
 //! Hyperliquid public market data client — READ-ONLY, keyless.
 //! Only POST {base}/info with public body types (meta / allMids / candleSnapshot).
-//! No signing, no exchange endpoint, no keys: this path never trades for real.
+//! No signing, no exchange endpoint, no keys: the week-1 kit never trades for real.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -156,7 +156,64 @@ impl HlClient {
         Ok(out)
     }
 
+    /// {type: clearinghouseState, user} -> the account's perp state. Read-only.
+    pub fn clearinghouse_state(&self, user: &str) -> Result<serde_json::Value> {
+        self.info(&serde_json::json!({ "type": "clearinghouseState", "user": user.trim().to_ascii_lowercase() }))
+    }
+
+    /// Current |position| notional (USD) for `coin` on `user`'s account, at `mark`.
+    /// The live order path uses this to enforce the POSITION cap: the guardrail
+    /// engine cannot see the account, so the caller must hand it the real number.
+    /// A missing field is an ERROR, never a zero: assuming "flat" would let an
+    /// agent stack positions past its own cap.
+    pub fn position_notional(&self, user: &str, coin: &str, mark: f64) -> Result<f64> {
+        let st = self.clearinghouse_state(user)?;
+        let arr = st
+            .get("assetPositions")
+            .and_then(|a| a.as_array())
+            .ok_or_else(|| anyhow::anyhow!("clearinghouseState: missing assetPositions array"))?;
+        for p in arr {
+            let pos = p.get("position").unwrap_or(p);
+            let c = pos.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+            if c.eq_ignore_ascii_case(coin) {
+                let szi = pos
+                    .get("szi")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .ok_or_else(|| anyhow::anyhow!("clearinghouseState: {coin} position has no readable szi"))?;
+                if !szi.is_finite() {
+                    return Err(anyhow::anyhow!("clearinghouseState: {coin} szi is not finite"));
+                }
+                return Ok((szi.abs() * mark).abs());
+            }
+        }
+        Ok(0.0)
+    }
+
+    /// Sum of the venue's own closed PnL (USD) since `start_ms`. The live order path
+    /// seeds the daily-loss cap from this: without it the cap can never trip.
+    pub fn realized_pnl_since(&self, user: &str, start_ms: i64) -> Result<f64> {
+        let v = self.info(&serde_json::json!({
+            "type": "userFillsByTime",
+            "user": user.trim().to_ascii_lowercase(),
+            "startTime": start_ms
+        }))?;
+        let arr = v
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("userFillsByTime: expected an array"))?;
+        let mut sum = 0.0;
+        for f in arr {
+            if let Some(p) = f.get("closedPnl").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                if p.is_finite() {
+                    sum += p;
+                }
+            }
+        }
+        Ok(sum)
+    }
+
     /// Latest mid for a coin from allMids (used by the simulator as the mark).
+
     pub fn mid_of(&self, coin: &str) -> Result<f64> {
         let mids = self.all_mids()?;
         mids

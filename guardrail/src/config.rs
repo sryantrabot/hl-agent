@@ -1,4 +1,5 @@
-//! Guardrail caps config: TOML in, validated struct out.
+//! Guardrail caps config: TOML in, validated struct out. Same field names and
+//! semantics as the product-side week-1 stub so the swap is drop-in.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

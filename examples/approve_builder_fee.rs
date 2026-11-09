@@ -1,4 +1,4 @@
-//! Builder-fee approval + verification, testnet by default (specs/hl-agent.md Week 2).
+//! Builder-fee approval + verification, testnet by default (the signed-order section of this README).
 //!
 //! This is the USER'S step in the kit's trust flow, written as a runnable example:
 //! the user's MAIN wallet signs ONE `approveBuilderFee` action (max fee you allow
@@ -13,7 +13,8 @@
 //!   cargo run -p hl-agent --example approve_builder_fee -- <main-wallet-hex-key> \
 //!       <builder-address> [fee_tenths_bp] [--mainnet]
 //!
-//! The key is read from argv, used in memory only, never logged. MAINNET requires
+//! The key is read from HL_MAIN_KEY only (never argv: it would land in your shell
+//! history and `ps`), used in memory only, never logged. MAINNET requires
 //! an explicit opt-in flag AND the env guard below, because approving on mainnet
 //! is a real, on-chain, revocable permission for real funds.
 
@@ -26,16 +27,26 @@ fn main() -> anyhow::Result<()> {
     if mainnet && std::env::var("HL_ALLOW_MAINNET").is_err() {
         bail!("--mainnet requires HL_ALLOW_MAINNET set in the environment (operator opt-in)");
     }
+    // The MAIN wallet key can withdraw everything you own, so it is never taken from
+    // argv: argv is visible in `ps`, in shell history and in your terminal scrollback.
+    // Read it from HL_MAIN_KEY and keep that variable out of your shell history.
     let mut it = args.into_iter();
-    let key = it.next().unwrap_or_default();
-    if key.is_empty() {
-        bail!("usage: approve_builder_fee <main-wallet-hex-key> <builder-address> [fee_tenths_bp] [--mainnet]");
+    let first = it.next().unwrap_or_default();
+    let key = if first.starts_with("0x") && first.len() == 66 {
+        bail!("refusing a key on the command line (it would land in your shell history and `ps`). Put it in HL_MAIN_KEY instead: HL_MAIN_KEY=0x... cargo run -p hl-agent --example approve_builder_fee -- <builder-address> [fee]");
+    } else {
+        std::env::var("HL_MAIN_KEY").unwrap_or_default()
+    };
+    if key.trim().is_empty() {
+        bail!("usage: HL_MAIN_KEY=0x... cargo run -p hl-agent --example approve_builder_fee -- [builder-address] [fee_tenths_bp] [--mainnet]\nThe key is read from HL_MAIN_KEY only, never from argv.");
     }
-    let builder_addr = it.next().unwrap_or_else(|| {
+    let builder_addr = if first.is_empty() {
         std::env::var("HL_BUILDER_ADDRESS").unwrap_or_else(|_| {
             "0x5a229a20D9636a07583D6868FABf4B2903271Ab7".to_string()
         })
-    });
+    } else {
+        first.clone()
+    };
     let fee_tenths_bp: u32 = it.next().map(|s| s.parse()).unwrap_or(Ok(20))?;
 
     let base = if mainnet { MAINNET } else { TESTNET };

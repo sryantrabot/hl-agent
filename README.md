@@ -70,6 +70,7 @@ rejected by the same caps that will guard its real orders in week 2.
 | `hl_allmids` | mid prices for all markets (`coins: ["BTC","ETH"]` filters) | public REST, no key |
 | `hl_candles` | OHLCV bars (`coin`, `interval`, `start_ms`, `end_ms`) | public REST, no key |
 | `simulate_order` | dry-run an order through the guardrail gate | none (or one mid fetch) |
+| `place_order_live` | place a REAL order, signed by your own agent key, only after the guardrails pass (only listed when you start with `--live`) | signed POST to Hyperliquid |
 
 `simulate_order` needs `--config`. Example call your agent makes:
 
@@ -85,10 +86,12 @@ Response carries `guardrail_decision` (`allow`/`reject` + reason), `fill_status`
 
 All caps live in one TOML file (see `examples/guardrail.example.toml`):
 
-- **position cap** — max |position| notional per coin (USD)
+- **position cap** — max |position| notional per coin (USD), checked against your account's
+  real position read from the venue on every live order
 - **order cap** — max single-order notional (USD)
 - **leverage cap** — order notional ≤ `max_leverage` × `account_equity_usd`
-- **daily loss cap** — stops for the UTC day once realized PnL ≤ −cap
+- **daily loss cap** — stops for the UTC day once realized PnL ≤ −cap; on live orders the
+  PnL comes from the venue's own fills since UTC midnight, not from a counter in this process
 - **loop tripwire** — rejects N near-identical orders inside a sliding window (stuck-loop
   protection for agents that retry)
 - **rate limit** — max order intents per rolling hour
@@ -118,13 +121,13 @@ revocable by you. Mechanics (verified from Hyperliquid docs, 2026-11-04):
 - Fee evidence is public: daily per-builder fill CSVs on Hyperliquid's stats host.
 
 Week 2 adds the local signer + builder-code attachment; week 3 ships example configs for
-common agent hosts. Spec of record: `specs/hl-agent.md`.
+common agent hosts. The signed-order section is below.
 
 ## License
 
 MIT.
 
-## Week 2: wire your agent key (specs/hl-agent.md §Week 2)
+## Wire your agent key (optional signed path)
 
 The kit now has an OPTIONAL signed path (`hl_agent::signer::AgentSigner` +
 `hl_agent::exchange::ExchangeClient`). The dry-run `DryRunSimulator` remains the
@@ -148,20 +151,63 @@ DEFAULT — nothing in the MCP server or the binary signs or places an order.
 - **Signature construction is VERIFIED against the official SDKs’ pinned vectors**
   (hyperliquid-rust-sdk + hyperliquid-python-sdk, fetched live 2026-11-05; the
   two SDK exchange_client test vectors + the create_signature EIP-712 vector pass
-  byte-exactly — 30/30 `cargo test -p hl-agent --lib` (includes the approveBuilderFee shape + end-to-end sign-and-recover tests), see specs/hl-agent.md Week 2).
+  byte-exactly — 30/30 `cargo test -p hl-agent --lib` (includes the approveBuilderFee shape + end-to-end sign-and-recover tests), see the signed-order section of this README).
   Mainnet use still requires explicit operator opt-in.
+
+## Placing real orders (`--live`)
+
+The dry-run simulator stays the default. Real orders need three things and nothing else:
+
+1. **Your own Hyperliquid API wallet key** in the environment as `HL_AGENT_KEY`. API wallets are
+   sign-only: they can sign orders, never withdraw, never approve. The key is read from that
+   variable only — never a flag, never a file, never `.env` — so it stays out of your shell
+   history and the process list.
+2. **`--user`**, your MAIN wallet address: the account the orders trade for. The venue compares it
+   with the key, so a wrong pair fails on the first order instead of trading the wrong account.
+3. **A guardrail config** (`--config`). The caps run *before* the signature exists.
+
+```sh
+# testnet first, tiny size, throwaway key
+export HL_AGENT_KEY=0x...            # your API wallet key (sign-only)
+cargo run -p hl-agent -- --live --testnet --user 0xYourMainWallet \
+    --config examples/guardrail.example.toml
+
+# mainnet, only after the testnet run behaved: same command plus --mainnet
+# and HL_ALLOW_MAINNET=1 in your environment.
+```
+
+Start with the smallest size your venue allows (Hyperliquid's minimum order value is $10). The
+first order is the real test: place one, read the receipt, and only then let your agent run.
+
+What `place_order_live` does, in order:
+
+1. Validates the arguments (limit orders only; `tif` is `Gtc`, `Ioc` or `Alo`).
+2. Runs every guardrail cap on the intent. A rejection returns `outcome: rejected` with the exact
+   reason and **nothing is signed, nothing is sent**.
+3. Asks the venue (`maxBuilderFee`) whether your main wallet approved our builder fee. Only when
+   the approval is at least our fee does the order carry `builder: {b, f}`. Otherwise it goes out
+   with **no builder field at all** and the response says why.
+4. Signs once and POSTs once. There is no retry: a nonce error is returned, never replayed.
+5. Returns the venue's own receipt (`FILLED 0.01 @ 2000` / `RESTING` / `NOT FILLED: …`), the
+   signed body for your audit trail, and one plain sentence for the errors users actually hit
+   (minimum order value, unknown agent wallet, nonce).
+
+Your agent key never leaves your machine and this server never asks for your main key.
 
 ## Approving the builder fee (your one signature)
 
-Every order our code sends on your behalf carries our builder address, so a small
-fee (we default to 2 bp, hard-capped at 10 bp in the kit) lands with the builder
-when your order fills. Before any of that works, your **main** wallet approves the
+
+An order carries our builder address only after YOUR main wallet approves it on the
+venue, and only for the fee you approved — without that approval the order goes out
+with no builder field at all. With it, a small fee (2 bp by default, hard-capped at
+10 bp in the kit) lands with the builder when your order fills. Before any of that works, your **main** wallet approves the
 fee once — an API/agent wallet cannot (the venue rejects it by design), and you can
 revoke it at any time from your account.
 
 ```sh
-# TESTNET (default; safe to run with a throwaway key):
-cargo run -p hl-agent --example approve_builder_fee -- <main-wallet-key> \
+# TESTNET (default; safe to run with a throwaway key). The key is read from
+# HL_MAIN_KEY, never from the command line.
+HL_MAIN_KEY=0x... cargo run -p hl-agent --example approve_builder_fee -- \
     0x5a229a20D9636a07583D6868FABf4B2903271Ab7 20
 
 # MAINNET: same command plus --mainnet, and HL_ALLOW_MAINNET set in your environment.
