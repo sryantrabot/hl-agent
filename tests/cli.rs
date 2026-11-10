@@ -91,3 +91,41 @@ fn mainnet_refuses_without_a_real_opt_in() {
         assert!(!stderr.contains(&throwaway), "the key must never be echoed: {stderr}");
     }
 }
+
+/// The kit asks at most 5 bp (50 tenths). A caller who passes a bigger number must be refused
+/// outright, not quietly granted a 10 bp approval for our address that the docs never offer.
+#[test]
+fn a_builder_fee_above_the_range_this_kit_asks_is_refused() {
+    let throwaway = format!("0x{}", "33".repeat(32));
+    for fee in ["51", "100", "0"] {
+        let out = Command::new(binary())
+            .args(["--approve-builder-fee", "--fee-tenths-bp", fee])
+            .env("HL_MAIN_KEY", &throwaway)
+            .env_remove("HL_ALLOW_MAINNET")
+            .output()
+            .expect("the binary must run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "fee {fee} must be refused: {stderr}");
+        assert!(
+            stderr.contains("1..=50") || stderr.contains("integer 1..=50"),
+            "it must name the accepted range for fee {fee}: {stderr}"
+        );
+        assert!(!stderr.contains(&throwaway), "the key must never be echoed: {stderr}");
+    }
+}
+
+/// ApproveBuilderFee is signed by the wallet for its own address. A `--user` here would be
+/// silently ignored, so passing one is an error rather than a no-op that invites a mistake.
+#[test]
+fn user_is_rejected_on_the_approve_path_instead_of_being_ignored() {
+    let throwaway = format!("0x{}", "44".repeat(32));
+    let out = Command::new(binary())
+        .args(["--approve-builder-fee", "--user", "0x0000000000000000000000000000000000000001"])
+        .env("HL_MAIN_KEY", &throwaway)
+        .output()
+        .expect("the binary must run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a stray --user must be refused: {stderr}");
+    assert!(stderr.contains("--user"), "it must name the flag: {stderr}");
+    assert!(!stderr.contains(&throwaway), "the key must never be echoed: {stderr}");
+}

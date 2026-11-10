@@ -1,4 +1,4 @@
-# hl-agent — guardrailed Hyperliquid kit for AI agents (v0.2.0)
+# hl-agent — guardrailed Hyperliquid kit for AI agents (v0.2.1)
 
 A Rust **MCP server** that gives your AI agent Hyperliquid market tools, a **dry-run order
 simulator** behind hard guardrail caps, and an OPTIONAL **live-order path**: your own
@@ -13,35 +13,38 @@ restarts.
 
 ## Install
 
-**Prebuilt binary (Linux ARM64, glibc 2.34+):** no Rust toolchain needed.
+**Prebuilt archive (Linux ARM64, glibc 2.34+):** no Rust toolchain needed.
 
 ```sh
-curl -L -O https://github.com/sryantrabot/hl-agent/releases/download/v0.2.0/hl-agent-aarch64-unknown-linux-gnu.tar.gz
-curl -L -O https://github.com/sryantrabot/hl-agent/releases/download/v0.2.0/hl-agent-aarch64-unknown-linux-gnu.tar.gz.sha256
-sha256sum -c hl-agent-aarch64-unknown-linux-gnu.tar.gz.sha256
-tar xzf hl-agent-aarch64-unknown-linux-gnu.tar.gz
-./hl-agent < /dev/null            # starts clean, answers MCP, Ctrl-D to exit
+curl -L -O https://github.com/sryantrabot/hl-agent/releases/download/v0.2.1/hl-agent-v0.2.1-aarch64-unknown-linux-gnu.tar.gz
+curl -L -O https://github.com/sryantrabot/hl-agent/releases/download/v0.2.1/hl-agent-v0.2.1-aarch64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c hl-agent-v0.2.1-aarch64-unknown-linux-gnu.tar.gz.sha256
+tar xzf hl-agent-v0.2.1-aarch64-unknown-linux-gnu.tar.gz
+cd hl-agent-v0.2.1
+sha256sum -c MANIFEST.sha256   # every file in this archive, the binary included
+./hl-agent --print-example-config > guardrail.toml   # a config with no checkout
+./hl-agent --check-config --config guardrail.toml
 ```
 
-The archive is the v0.2.0 tag build (`7d81b65`), which predates `main` in two ways: its
-`--check-config` prints a caps line over built-in defaults even when you passed no file, and it
-has no `--approve-builder-fee` or `--print-example-config`. Both are in `main` now: to get
-them today build from source at the branch head with the `--branch main` line below (the
-`--tag v0.2.0` line does NOT have them); a new archive with them is next.
+The v0.2.1 release carries `--approve-builder-fee` and `--print-example-config`. If that
+download is missing, the release is not published yet: build from source with the `--branch
+main` line below and retry later. The v0.2.0 archive is a bare executable with neither flag; if you
+installed that one, move to v0.2.1.
 
 **Any other platform (x86_64 Linux, macOS, older ARM), about two minutes:**
 
 ```sh
-# branch head: has --approve-builder-fee and --print-example-config
+# branch head: has --approve-builder-fee and --print-example-config today
 cargo install --locked --git https://github.com/sryantrabot/hl-agent --branch main
-# the pinned release instead (v0.2.0): same kit, but NOT the two flags above
-# cargo install --locked --git https://github.com/sryantrabot/hl-agent --tag v0.2.0
+# once the v0.2.1 release is published, its tag is the source the archive is built from:
+# cargo install --locked --git https://github.com/sryantrabot/hl-agent --tag v0.2.1
 ```
 
 `--locked` matters: without it cargo can resolve newer crates than the committed `Cargo.lock`.
 A C compiler must be installed, because the TLS library builds native code. There is **no
-x86_64 prebuilt archive**; do not use the file named `hl-agent-x86_64-unknown-linux-gnu.tar.gz`
-on the v0.2.0 release page, it holds an ARM64 binary (see the release notes).
+x86_64 prebuilt archive**: build it with the line above. (The asset named
+`hl-agent-x86_64-unknown-linux-gnu.tar.gz` on the v0.2.0 release page holds an ARM64 binary;
+that name is wrong and the bytes are left in place, as its release notes say.)
 
 **From a checkout:**
 
@@ -58,8 +61,8 @@ cargo run -p hl-agent -- --check-config --config my.toml   # validate caps and e
 testnet API · `--live` enable the real-order tool · `--user <addr>` main wallet the orders
 trade for · `--builder <addr>` builder address · `--fee-tenths-bp <n>` fee, tenths of a bp · `--base <url>` override the API URL.
 `--approve-builder-fee` sign the one-off builder-fee approval and exit · `--print-example-config`
-print the guardrail TOML to stdout. Both of these are on `main` and in any build from it; the
-v0.2.0 archive below predates them. There is no `--help`; this list is it.
+print the guardrail TOML to stdout. Both are in the v0.2.1 archive and in any build from `main`;
+the v0.2.0 archive predates them. There is no `--help`; this list is it.
 
 ## Wire it to your agent host (quickstart)
 
@@ -167,7 +170,8 @@ so the agent can correct itself instead of retrying blind.
 
 Orders you approve will carry our builder code: `builder: {b: <address>, f: <fee in tenths
 of bp>}` — a 2–5 bp per-trade fee paid to the kit maintainer, capped at approval time and
-revocable by you. Mechanics (verified from Hyperliquid docs, 2026-11-04):
+revocable by you. It is only collected once that builder address holds the venue's 100 USDC
+minimum, which the maintainer builder does not yet, so treat the fee as zero for now. Mechanics (verified from Hyperliquid docs, 2026-11-04):
 
 - You approve **once** from your main wallet via `ApproveBuilderFee` with a max-fee cap;
   revocable anytime.
@@ -199,11 +203,13 @@ and then only after every cap in your TOML passes.
   our builder address and can revoke at any time.
 - **Builder code on every order.** `place_order_with_builder` attaches
   `builder: {"b": <our address>, "f": <fee>}`; `f` is tenths of a basis point — our
-  range is 20–50 (2–5 bp). The kit enforces the venue caps (10 bp perps, 100 bp spot;
-  spot buys cannot carry a builder fee) and refuses to sign anything over the cap.
-- **Testnet first.** `ExchangeClient::testnet` is the default base; MAINNET exists as
-  a const for explicit operator opt-in only. Nonce errors are returned, never retried
-  (Hyperliquid's nonce window makes blind replays dangerous).
+  range is 20–50 (2–5 bp), and --approve-builder-fee refuses any --fee-tenths-bp outside
+  1..=50. The venue caps are 10 bp perps and 100 bp spot; spot buys cannot carry a
+  builder fee.
+- **Testnet first.** The binary's default base URL is MAINNET; `--testnet` switches to the
+  testnet API, and every mainnet signature is additionally gated by `HL_ALLOW_MAINNET=1`.
+  `ExchangeClient::testnet` is the constructor the tests and examples use. Nonce errors are
+  returned, never retried (Hyperliquid's nonce window makes blind replays dangerous).
 - **Signature construction is VERIFIED against the official SDKs’ pinned vectors**
   (hyperliquid-rust-sdk + hyperliquid-python-sdk, fetched live 2026-11-05; the
   two SDK exchange_client test vectors + the create_signature EIP-712 vector pass
@@ -262,8 +268,12 @@ Your agent key never leaves your machine and this server never asks for your mai
 
 An order carries our builder address only after YOUR main wallet approves it on the
 venue, and only for the fee you approved — without that approval the order goes out
-with no builder field at all. With it, a small fee (2 bp by default, hard-capped at
-10 bp in the kit) lands with the builder when your order fills. Before any of that works, your **main** wallet approves the
+with no builder field at all. With it, a fee up to the cap you approved (2 bp by
+default, and this kit never asks above 5 bp) is added to each fill and paid to the
+builder, provided the builder address itself holds at least 100 USDC in perps account
+value in standard account-abstraction mode (a Hyperliquid requirement). The maintainer
+builder is not funded as of this release, so expect no fee to be collected yet. Your
+order and its fill price are unaffected either way. Before any of that works, your **main** wallet approves the
 fee once — an API/agent wallet cannot (the venue rejects it by design), and you can
 revoke it at any time from your account.
 
@@ -276,7 +286,7 @@ read -rs HL_MAIN_KEY && export HL_MAIN_KEY
 # Use the account that actually trades: the venue refuses this action for an address it has
 # never seen (see the limitation below), so a brand-new throwaway wallet will not work.
 # This is the binary itself: no cargo, no checkout. It needs a build that has the flag
-# (--branch main above; the v0.2.0 archive does not).
+# (--tag v0.2.1 or --branch main; the v0.2.0 archive does not).
 ./hl-agent --approve-builder-fee --fee-tenths-bp 20
 
 # MAINNET is the default base URL, so the line above IS mainnet unless you add --testnet;

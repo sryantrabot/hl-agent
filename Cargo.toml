@@ -2,7 +2,7 @@
 
 [package]
 name = "hl-agent"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "Guardrailed Hyperliquid kit for AI agents: a stdio MCP server with read-only market tools, a dry-run order simulator, and an OPTIONAL live-order path that signs with YOUR OWN sign-only agent key after the guardrail caps pass. Dry-run is the default: no key, no order."

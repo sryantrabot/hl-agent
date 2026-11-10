@@ -8,7 +8,7 @@
 //!                     this flag the process holds no key and no signing code runs at all.
 //!   --user <0x...>    the account the orders trade for (your MAIN wallet address); required by --live
 //!   --builder <0x...> builder address to attach after YOUR approval (default: the kit maintainer's)
-//!   --fee-tenths-bp N our builder fee, 1..=100 tenths of a bp (default 20 = 2 bp)
+//!   --fee-tenths-bp N our builder fee, 1..=50 tenths of a bp (default 20 = 2 bp)
 //! The agent key is NEVER a flag: --live reads it from the HL_AGENT_KEY environment variable only,
 //! so it cannot land in argv, shell history or a process list.
 use hl_agent::guardrail::Guardrail;
@@ -56,7 +56,7 @@ fn main() {
                 let raw = args.get(i).cloned().unwrap_or_else(|| die("--fee-tenths-bp needs a number"));
                 fee_tenths_bp = raw
                     .parse()
-                    .unwrap_or_else(|_| die("--fee-tenths-bp must be an integer 1..=100 (tenths of a basis point)"));
+                    .unwrap_or_else(|_| die("--fee-tenths-bp must be an integer 1..=50 (tenths of a basis point, 0.1 to 5 bp)"));
             }
             other => die(&format!("unknown flag: {other} (see --help in README.md)")),
         }
@@ -75,7 +75,7 @@ fn main() {
     // cargo and no examples/ directory, so this has to exist in the binary itself or the
     // documented no-toolchain install can never attach the builder code.
     if approve_only {
-        approve_builder_fee_cmd(&base, builder.as_deref(), fee_tenths_bp);
+        approve_builder_fee_cmd(&base, builder.as_deref(), fee_tenths_bp, user.as_deref());
         return;
     }
 
@@ -157,14 +157,15 @@ fn build_live(
     if !user.starts_with("0x") || user.len() != 42 {
         die(&format!("--user looks wrong ({user}): expected a 42-character 0x address"));
     }
-    if !(1..=100).contains(&fee_tenths_bp) {
-        die(&format!("--fee-tenths-bp {fee_tenths_bp} is outside 1..=100 (0.1 to 10 bp); the venue caps perps at 10 bp"));
+    if !(1..=50).contains(&fee_tenths_bp) {
+        die(&format!("--fee-tenths-bp {fee_tenths_bp} is outside 1..=50 (0.1 to 5 bp), the range this kit asks; the venue caps perps at 10 bp"));
     }
     let key = std::env::var("HL_AGENT_KEY").unwrap_or_else(|_| {
         die("--live needs HL_AGENT_KEY in the environment (your Hyperliquid API-wallet key). It is never read from a flag, a file or .env by this kit.")
     });
     let signer = hl_agent::AgentSigner::from_hex_key(&key)
-        .unwrap_or_else(|e| die(&format!("HL_AGENT_KEY is not a usable key: {e}")));
+        // Discard the library error: alloy quotes the offending character of the key.
+        .unwrap_or_else(|_| die("HL_AGENT_KEY is not a usable 0x-prefixed 32-byte hex key. Nothing was signed."));
     // Default builder: the kit maintainer's address, so a user who follows the README
     // earns us the fee we ask for. It only ever RIDES on an order after the venue
     // reports the user approved us — no approval, no builder field, order unaffected.
@@ -294,14 +295,20 @@ fn is_testnet(base_url: &str) -> bool {
 ///
 /// The user's MAIN wallet signs here. That key controls the account's funds, so it is read
 /// from HL_MAIN_KEY only (never a flag: argv lands in shell history and `ps`), used in
-/// memory, never printed, and the process exits as soon as the action is confirmed. Testnet
-/// is the default (--testnet); mainnet is the default base URL and needs HL_ALLOW_MAINNET=1.
-fn approve_builder_fee_cmd(base: &Option<String>, builder: Option<&str>, fee_tenths_bp: u32) {
+/// memory, never printed, and the process exits as soon as the action is confirmed. The default
+/// base URL is MAINNET; --testnet switches to the testnet API, and every mainnet signature
+/// additionally needs HL_ALLOW_MAINNET=1. So --user is rejected here: the key signs for itself.
+fn approve_builder_fee_cmd(base: &Option<String>, builder: Option<&str>, fee_tenths_bp: u32, user: Option<&str>) {
+    // ApproveBuilderFee is signed BY the approving wallet, for itself. A --user here would be
+    // silently ignored and invites the wrong-account mistake the live path guards against.
+    if let Some(u) = user {
+        die(&format!("--user {u} is not used by --approve-builder-fee: your own main wallet signs this, for that same address. Drop --user."));
+    }
     let base_url = base.clone().unwrap_or_else(|| MAINNET.to_string());
     // `--testnet` sets the testnet base URL; anything else is mainnet and needs the opt-in.
     let on_testnet = is_testnet(&base_url);
-    if !(1..=100).contains(&fee_tenths_bp) {
-        die(&format!("--fee-tenths-bp {fee_tenths_bp} is outside 1..=100 (0.1 to 10 bp); the venue caps perps at 10 bp"));
+    if !(1..=50).contains(&fee_tenths_bp) {
+        die(&format!("--fee-tenths-bp {fee_tenths_bp} is outside 1..=50 (0.1 to 5 bp), the range this kit asks; the venue caps perps at 10 bp"));
     }
     let builder_addr = builder.unwrap_or(DEFAULT_BUILDER).to_string();
     if hl_agent::validate_builder_address(&builder_addr).is_err() {
@@ -322,7 +329,7 @@ fn approve_builder_fee_cmd(base: &Option<String>, builder: Option<&str>, fee_ten
     // hides the key error from a user who simply has not exported it yet.
     let mainnet_ok = std::env::var("HL_ALLOW_MAINNET").ok().map(|v| mainnet_opt_in(&v)).unwrap_or(false);
     if !on_testnet && !mainnet_ok {
-        die("--approve-builder-fee on mainnet needs HL_ALLOW_MAINNET=1 in the environment. Rehearse on --testnet with a throwaway main wallet first.");
+        die("--approve-builder-fee on mainnet needs HL_ALLOW_MAINNET=1 in the environment. Rehearse on --testnet from the account that will trade; the venue refuses approvals from an address it has never seen (see the Multi-sig note in README.md).");
     }
     let chain = if on_testnet { "testnet" } else { "MAINNET" };
     let user = signer.address();
@@ -339,7 +346,7 @@ fn approve_builder_fee_cmd(base: &Option<String>, builder: Option<&str>, fee_ten
     let action = hl_agent::ExchangeClient::approve_builder_fee_action(&builder_addr, fee_tenths_bp, nonce, !on_testnet)
         .unwrap_or_else(|e| die(&format!("could not build the approveBuilderFee action: {e}")));
     eprintln!("hl-agent: {chain}; main wallet {user} approves builder {builder_addr} up to {} bp per fill", f64::from(fee_tenths_bp) / 10.0);
-    eprintln!("hl-agent: signed action (audit this before it lands next time): {action}");
+    eprintln!("hl-agent: signed action (the exact bytes being sent): {action}");
     let resp = client
         .approve_builder_fee(&builder_addr, fee_tenths_bp, nonce, !on_testnet)
         .unwrap_or_else(|e| die(&format!("approveBuilderFee request failed: {e}")));
