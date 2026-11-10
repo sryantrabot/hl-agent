@@ -25,6 +25,8 @@ fn main() {
     let mut user: Option<String> = None;
     let mut builder: Option<String> = None;
     let mut fee_tenths_bp: u32 = 20;
+    let mut approve_only = false;
+    let mut print_example_config = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -47,6 +49,8 @@ fn main() {
                 i += 1;
                 builder = Some(args.get(i).cloned().unwrap_or_else(|| die("--builder needs a 0x address")));
             }
+            "--approve-builder-fee" => approve_only = true,
+            "--print-example-config" => print_example_config = true,
             "--fee-tenths-bp" => {
                 i += 1;
                 let raw = args.get(i).cloned().unwrap_or_else(|| die("--fee-tenths-bp needs a number"));
@@ -57,6 +61,22 @@ fn main() {
             other => die(&format!("unknown flag: {other} (see --help in README.md)")),
         }
         i += 1;
+    }
+
+    // A prebuilt/`cargo install` user has no examples/ directory, but the README quickstart
+    // hands them `examples/guardrail.example.toml`. Printing the same file from the binary
+    // keeps that copy-paste from failing with "no such file".
+    if print_example_config {
+        print!("{}", include_str!("../examples/guardrail.example.toml"));
+        return;
+    }
+
+    // The ONE signature that pays the maintainer. A user of the prebuilt archive has no
+    // cargo and no examples/ directory, so this has to exist in the binary itself or the
+    // documented no-toolchain install can never attach the builder code.
+    if approve_only {
+        approve_builder_fee_cmd(&base, builder.as_deref(), fee_tenths_bp);
+        return;
     }
 
     let cfg = match &config {
@@ -152,8 +172,9 @@ fn build_live(
         .or_else(|| std::env::var("HL_BUILDER_ADDRESS").ok())
         .or_else(|| Some(DEFAULT_BUILDER.to_string()));
     let is_mainnet = base_url == MAINNET;
-    if is_mainnet && std::env::var("HL_ALLOW_MAINNET").is_err() {
-        die("mainnet orders need HL_ALLOW_MAINNET set in the environment. Start on --testnet with a throwaway key.");
+    // Same allowlist as the approve command: "off" or "0" is not consent for real orders.
+    if is_mainnet && !std::env::var("HL_ALLOW_MAINNET").ok().map(|v| mainnet_opt_in(&v)).unwrap_or(false) {
+        die("mainnet orders need HL_ALLOW_MAINNET=1 in the environment (only 1, true, yes or on count). Start on --testnet with a throwaway key.");
     }
     // PROVE the account before arming: the signed action carries no user field, so the
     // venue cannot catch a wrong --user. A wrong one (a typo, the API wallet's own
@@ -246,4 +267,138 @@ mod tests {
         assert!(!with_file.contains("BUILT-IN"), "a real file is not built-in: {with_file}");
         assert!(with_file.contains("pos=42.00usd"), "quotes the user's own number: {with_file}");
     }
+}
+
+
+/// Strict consent, as an ALLOWLIST: only "1", "true", "yes" or "on" unlock mainnet signing.
+/// A denylist was wrong and a critic proved it: `HL_ALLOW_MAINNET=off` slipped through and
+/// signed a real mainnet approval. Anything unrecognised (empty, "0", "off", a typo, an
+/// exported-but-empty var) must refuse: the cost of the wrong answer is a MAIN wallet signature
+/// over real funds.
+fn mainnet_opt_in(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Which network a approval targets. Testnet must be named exactly; anything else,
+/// including a custom --base URL, is treated as MAINNET and so needs the opt-in (fail-closed).
+fn is_testnet(base_url: &str) -> bool {
+    base_url.trim_end_matches('/') == TESTNET.trim_end_matches('/')
+}
+
+/// `--approve-builder-fee`: the user's ONE signature, available in the shipped binary.
+///
+/// The prebuilt archive is a bare executable: no cargo, no `examples/` directory. Before
+/// this command existed, the only way to run `approveBuilderFee` was `cargo run --example`,
+/// so a user who took the "no Rust toolchain needed" install could never attach our builder
+/// code — the documented install path could not pay the maintainer at all.
+///
+/// The user's MAIN wallet signs here. That key controls the account's funds, so it is read
+/// from HL_MAIN_KEY only (never a flag: argv lands in shell history and `ps`), used in
+/// memory, never printed, and the process exits as soon as the action is confirmed. Testnet
+/// is the default (--testnet); mainnet is the default base URL and needs HL_ALLOW_MAINNET=1.
+fn approve_builder_fee_cmd(base: &Option<String>, builder: Option<&str>, fee_tenths_bp: u32) {
+    let base_url = base.clone().unwrap_or_else(|| MAINNET.to_string());
+    // `--testnet` sets the testnet base URL; anything else is mainnet and needs the opt-in.
+    let on_testnet = is_testnet(&base_url);
+    if !(1..=100).contains(&fee_tenths_bp) {
+        die(&format!("--fee-tenths-bp {fee_tenths_bp} is outside 1..=100 (0.1 to 10 bp); the venue caps perps at 10 bp"));
+    }
+    let builder_addr = builder.unwrap_or(DEFAULT_BUILDER).to_string();
+    if hl_agent::validate_builder_address(&builder_addr).is_err() {
+        die(&format!("--builder {builder_addr} is not a usable 0x address"));
+    }
+    let key = std::env::var("HL_MAIN_KEY").unwrap_or_else(|_| {
+        die("--approve-builder-fee needs HL_MAIN_KEY in the environment (your MAIN wallet key, the one that can withdraw). Read it without echoing: read -rs HL_MAIN_KEY && export HL_MAIN_KEY")
+    });
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        die("HL_MAIN_KEY is empty. Read it without echoing: read -rs HL_MAIN_KEY && export HL_MAIN_KEY");
+    }
+    // Never echo the key or a library error that quoted it: keep the diagnosis, drop the value.
+    let signer = hl_agent::AgentSigner::from_hex_key(&key).unwrap_or_else(|_| {
+        die("HL_MAIN_KEY is not a usable 0x-prefixed 32-byte hex key. Nothing was signed.")
+    });
+    // Only now that a real key exists does the mainnet opt-in matter: asking for it first
+    // hides the key error from a user who simply has not exported it yet.
+    let mainnet_ok = std::env::var("HL_ALLOW_MAINNET").ok().map(|v| mainnet_opt_in(&v)).unwrap_or(false);
+    if !on_testnet && !mainnet_ok {
+        die("--approve-builder-fee on mainnet needs HL_ALLOW_MAINNET=1 in the environment. Rehearse on --testnet with a throwaway main wallet first.");
+    }
+    let chain = if on_testnet { "testnet" } else { "MAINNET" };
+    let user = signer.address();
+
+    // Read the venue BEFORE signing: never spend a signature on a network we cannot reach.
+    if HlClient::new(&base_url).all_mids().is_err() {
+        die(&format!("{chain} API did not answer before signing; nothing was signed or sent. Retry when the venue is reachable."));
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_else(|_| die("system clock is before 1970; refusing to sign a nonce"));
+    let client = hl_agent::ExchangeClient::new(&base_url, signer);
+    let action = hl_agent::ExchangeClient::approve_builder_fee_action(&builder_addr, fee_tenths_bp, nonce, !on_testnet)
+        .unwrap_or_else(|e| die(&format!("could not build the approveBuilderFee action: {e}")));
+    eprintln!("hl-agent: {chain}; main wallet {user} approves builder {builder_addr} up to {} bp per fill", f64::from(fee_tenths_bp) / 10.0);
+    eprintln!("hl-agent: signed action (audit this before it lands next time): {action}");
+    let resp = client
+        .approve_builder_fee(&builder_addr, fee_tenths_bp, nonce, !on_testnet)
+        .unwrap_or_else(|e| die(&format!("approveBuilderFee request failed: {e}")));
+    if !resp.is_ok() {
+        // The venue decides. New, empty accounts are refused with "Multi-sig required", which
+        // is not about multi-sig: it is the venue declining an account it cannot act on yet.
+        let reason = resp.error_text();
+        let hint = if reason.to_ascii_lowercase().contains("multi-sig") {
+            " (observed 2026-11-10 on a never-used throwaway wallet. If your account is funded and you still see this, the venue is not accepting a single-key approval for it, and this command cannot help: use a route the venue accepts)"
+        } else {
+            ""
+        };
+        die(&format!("the venue refused the approval: {reason}{hint}"));
+    }
+    // Prove it landed with a keyless read of the venue's own state, not with our response.
+    match client.max_builder_fee(&user.to_string(), &builder_addr) {
+        Ok(max) if max >= fee_tenths_bp => {
+            println!(
+                "PASS: maxBuilderFee({user}, {builder_addr}) = {max} tenths of bp — the builder may charge up to {} bp per fill, revocable any time from your account page.",
+                f64::from(max) / 10.0
+            );
+        }
+        Ok(max) => {
+            die(&format!("the venue accepted the action but maxBuilderFee reads {max} < {fee_tenths_bp}; the approval is not active. Nothing else was sent."));
+        }
+        Err(e) => {
+            die(&format!("the approval was accepted but could not be re-read from the venue ({e}); check maxBuilderFee in the UI before relying on it."));
+        }
+    }
+}
+
+#[cfg(test)]
+mod approve_cmd_tests {
+    use super::*;
+
+    /// A custom `--base` must NOT be treated as a rehearsal: only the exact testnet URL is
+    /// testnet, everything else (including a typo or a proxy) is mainnet and so needs the
+    /// opt-in. Fail-closed matters because the wrong answer spends a MAIN wallet signature.
+    #[test]
+    fn only_the_exact_testnet_url_is_a_rehearsal() {
+        assert!(is_testnet(TESTNET));
+        assert!(is_testnet(&format!("{TESTNET}/")), "a trailing slash is the same venue");
+        assert!(!is_testnet(MAINNET));
+        assert!(!is_testnet("https://my-proxy.example/hl"), "a custom base is not a rehearsal");
+        assert!(!is_testnet("https://api.hyperliquid-testnet.xyz.evil.example"), "a lookalike host is not testnet");
+        assert!(!is_testnet(""));
+    }
+
+    /// `HL_ALLOW_MAINNET` is consent for a real, revocable, on-chain permission on real funds.
+    /// Exported-but-empty, "0", "false" and "no" are NOT consent. This is the gate; get it
+    /// wrong and a user signs on mainnet without ever saying yes.
+    #[test]
+    fn the_mainnet_opt_in_needs_a_real_yes() {
+        for yes in ["1", "true", "YES", "yes", "on", " 1 "] {
+            assert!(mainnet_opt_in(yes), "{yes:?} is a yes");
+        }
+        for no in ["", " ", "0", "false", "FALSE", "no", "No", "off", "OFF", "disabled", "2", "y"] {
+            assert!(!mainnet_opt_in(no), "{no:?} is not consent");
+        }
+    }
+
 }

@@ -337,7 +337,7 @@ impl<V: Venue> LiveTrader<V> {
                 }
                 Ok(approved) => {
                     builder_omitted_reason = Some(format!(
-                        "user approved {approved} tenths of a bp for {addr}, below our {} — order sent WITHOUT a builder fee; run examples/approve_builder_fee.rs to let our fee ride along",
+                        "user approved {approved} tenths of a bp for {addr}, below our {} — order sent WITHOUT a builder fee; run `hl-agent --approve-builder-fee` to let our fee ride along",
                         self.cfg.fee_tenths_bp
                     ));
                 }

@@ -23,14 +23,19 @@ tar xzf hl-agent-aarch64-unknown-linux-gnu.tar.gz
 ./hl-agent < /dev/null            # starts clean, answers MCP, Ctrl-D to exit
 ```
 
-The archive is the v0.2.0 tag build (`7d81b65`), one fix behind `main`: its `--check-config`
-prints a caps line over built-in defaults even when you passed no file. Run it with your own
-`--config` and the output is about your caps.
+The archive is the v0.2.0 tag build (`7d81b65`), which predates `main` in two ways: its
+`--check-config` prints a caps line over built-in defaults even when you passed no file, and it
+has no `--approve-builder-fee` or `--print-example-config`. Both are in `main` now: to get
+them today build from source at the branch head with the `--branch main` line below (the
+`--tag v0.2.0` line does NOT have them); a new archive with them is next.
 
 **Any other platform (x86_64 Linux, macOS, older ARM), about two minutes:**
 
 ```sh
-cargo install --locked --git https://github.com/sryantrabot/hl-agent --tag v0.2.0
+# branch head: has --approve-builder-fee and --print-example-config
+cargo install --locked --git https://github.com/sryantrabot/hl-agent --branch main
+# the pinned release instead (v0.2.0): same kit, but NOT the two flags above
+# cargo install --locked --git https://github.com/sryantrabot/hl-agent --tag v0.2.0
 ```
 
 `--locked` matters: without it cargo can resolve newer crates than the committed `Cargo.lock`.
@@ -52,7 +57,9 @@ cargo run -p hl-agent -- --check-config --config my.toml   # validate caps and e
 `--config <file>` guardrail caps · `--check-config` validate and exit · `--testnet` use the
 testnet API · `--live` enable the real-order tool · `--user <addr>` main wallet the orders
 trade for · `--builder <addr>` builder address · `--fee-tenths-bp <n>` fee, tenths of a bp · `--base <url>` override the API URL.
-There is no `--help`; this list is it.
+`--approve-builder-fee` sign the one-off builder-fee approval and exit · `--print-example-config`
+print the guardrail TOML to stdout. Both of these are on `main` and in any build from it; the
+v0.2.0 archive below predates them. There is no `--help`; this list is it.
 
 ## Wire it to your agent host (quickstart)
 
@@ -79,7 +86,7 @@ printf '%s\n' \
  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
- | ./hl-agent --config examples/guardrail.example.toml
+ | ./hl-agent --config guardrail.toml
 ```
 
 ### Why guardrails (read this before you wire your agent in)
@@ -124,7 +131,8 @@ Response carries `guardrail_decision` (`allow`/`reject` + reason), `fill_status`
 
 ## Guardrails (the point of the kit)
 
-All caps live in one TOML file (see `examples/guardrail.example.toml`):
+All caps live in one TOML file. Get a starting point from `examples/guardrail.example.toml` in
+the repo, or with no checkout at all: `./hl-agent --print-example-config > guardrail.toml`.
 
 - **position cap** — max |position| notional per coin (USD), judged on the position AFTER the
   order using the venue's own signed position on every live order: a sell against a short is
@@ -199,7 +207,7 @@ and then only after every cap in your TOML passes.
 - **Signature construction is VERIFIED against the official SDKs’ pinned vectors**
   (hyperliquid-rust-sdk + hyperliquid-python-sdk, fetched live 2026-11-05; the
   two SDK exchange_client test vectors + the create_signature EIP-712 vector pass
-  byte-exactly — 30/30 `cargo test -p hl-agent --lib` (includes the approveBuilderFee shape + end-to-end sign-and-recover tests), see the signed-order section above).
+  byte-exactly — 60/60 `cargo test -p hl-agent --lib` (includes the approveBuilderFee shape + end-to-end sign-and-recover tests), see the signed-order section above).
   Mainnet use still requires explicit operator opt-in.
 
 ## Placing real orders (`--live`)
@@ -224,8 +232,8 @@ that variable the kit refuses to sign and exits. `--testnet` needs nothing extra
 ```sh
 # testnet first, tiny size, throwaway key
 export HL_AGENT_KEY=0x...            # your API wallet key (sign-only)
-cargo run -p hl-agent -- --live --testnet --user 0xYourMainWallet \
-    --config examples/guardrail.example.toml
+./hl-agent --live --testnet --user 0xYourMainWallet \
+    --config my-guardrail.toml
 # mainnet, only after the testnet run behaved: DROP --testnet and set HL_ALLOW_MAINNET=1.
 # There is no --mainnet flag on the server: mainnet is the default base URL, gated by that
 # env var so it cannot happen by accident.
@@ -265,19 +273,30 @@ revoke it at any time from your account.
 # history and in the process list). Read it into the environment without echoing it:
 read -rs HL_MAIN_KEY && export HL_MAIN_KEY
 
-# TESTNET first (safe to rehearse with a throwaway main wallet):
-cargo run -p hl-agent --example approve_builder_fee -- \
-    0x5a229a20D9636a07583D6868FABf4B2903271Ab7 20
+# Use the account that actually trades: the venue refuses this action for an address it has
+# never seen (see the limitation below), so a brand-new throwaway wallet will not work.
+# This is the binary itself: no cargo, no checkout. It needs a build that has the flag
+# (--branch main above; the v0.2.0 archive does not).
+./hl-agent --approve-builder-fee --fee-tenths-bp 20
 
-# MAINNET (the example DOES take --mainnet): add --mainnet after the fee and set
-# HL_ALLOW_MAINNET so the opt-in is deliberate.
+# MAINNET is the default base URL, so the line above IS mainnet unless you add --testnet;
+# HL_ALLOW_MAINNET=1 is required there (only 1, true, yes or on count). It signs ONE
+# approveBuilderFee action, then re-reads maxBuilderFee from the venue and prints the
+# approved cap when the approval is active.
+# From a checkout, `cargo run -p hl-agent -- --approve-builder-fee` is the same thing.
 ```
 
-You approve once and can revoke it in the Hyperliquid UI at any time. If you would rather not
-handle the key at all, approve the builder in the Hyperliquid UI instead — the kit reads the
-approval from the venue either way.
+The venue is the judge, not this kit: it re-reads your approval on every order before a builder
+field is attached, so an approval you later revoke stops the fee immediately.
+Known limitation: on 2026-11-10 this refused a never-used throwaway wallet with "Multi-sig
+required". If your own funded account returns that too, the venue is not taking a single-key
+approval from you and this command cannot help; use a route the venue accepts. If you would rather not hand this binary your main key, the official Python SDK ships
+the same action (hyperliquid-python-sdk `examples/basic_builder_fee.py`), and anything that lands
+an `ApproveBuilderFee` for 0x5a229a20D9636a07583D6868FABf4B2903271Ab7 works — the kit reads the
+approval from the venue, never from a file.
 
-The example signs the one `approveBuilderFee` action, then checks it landed by
+`--approve-builder-fee` signs the one `approveBuilderFee` action, then checks it landed by
 querying `maxBuilderFee(your_address, builder)` — it prints the approved cap when
-the check passes. No other signature from you is ever needed, and placing orders
-without the approval simply fails on the venue side.
+the check passes, and exits non-zero with the venue's own words when it does not. No other
+signature from you is ever needed. Without the approval nothing
+breaks: your orders still go, they just carry no builder field, so you pay the venue alone.
