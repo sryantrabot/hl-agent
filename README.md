@@ -11,7 +11,34 @@ mainnet. The kit is MIT-licensed with no warranty: the caps you write and the ag
 at it are yours to own. Rate-limit and tripwire state live in the process and reset when it
 restarts.
 
-## Install & run
+## Install
+
+**Prebuilt binary (Linux ARM64, glibc 2.34+):** no Rust toolchain needed.
+
+```sh
+curl -L -O https://github.com/sryantrabot/hl-agent/releases/download/v0.2.0/hl-agent-aarch64-unknown-linux-gnu.tar.gz
+curl -L -O https://github.com/sryantrabot/hl-agent/releases/download/v0.2.0/hl-agent-aarch64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c hl-agent-aarch64-unknown-linux-gnu.tar.gz.sha256
+tar xzf hl-agent-aarch64-unknown-linux-gnu.tar.gz
+./hl-agent < /dev/null            # starts clean, answers MCP, Ctrl-D to exit
+```
+
+The archive is the v0.2.0 tag build (`7d81b65`), one fix behind `main`: its `--check-config`
+prints a caps line over built-in defaults even when you passed no file. Run it with your own
+`--config` and the output is about your caps.
+
+**Any other platform (x86_64 Linux, macOS, older ARM), about two minutes:**
+
+```sh
+cargo install --locked --git https://github.com/sryantrabot/hl-agent --tag v0.2.0
+```
+
+`--locked` matters: without it cargo can resolve newer crates than the committed `Cargo.lock`.
+A C compiler must be installed, because the TLS library builds native code. There is **no
+x86_64 prebuilt archive**; do not use the file named `hl-agent-x86_64-unknown-linux-gnu.tar.gz`
+on the v0.2.0 release page, it holds an ARM64 binary (see the release notes).
+
+**From a checkout:**
 
 ```sh
 cargo run -p hl-agent                      # read-only market tools only
@@ -19,6 +46,13 @@ cargo run -p hl-agent -- --config examples/guardrail.example.toml   # + dry-run 
 cargo run -p hl-agent -- --testnet         # Hyperliquid testnet API
 cargo run -p hl-agent -- --check-config --config my.toml   # validate caps and exit
 ```
+
+## Flags
+
+`--config <file>` guardrail caps · `--check-config` validate and exit · `--testnet` use the
+testnet API · `--live` enable the real-order tool · `--user <addr>` main wallet the orders
+trade for · `--builder <addr>` builder address · `--fee-tenths-bp <n>` fee, tenths of a bp · `--base <url>` override the API URL.
+There is no `--help`; this list is it.
 
 ## Wire it to your agent host (quickstart)
 
@@ -65,8 +99,8 @@ fixed order, and the first cap broken stops the order:
   retrying blind
 - after each simulated fill: fill status, position after, realized PnL today
 
-In week 1 the gate runs with no orders and no keys. Your agent rehearses against the live market and gets
-rejected by the same caps that will guard its real orders in week 2.
+Without `--live` the gate runs against the live market with no orders and no keys: your agent
+rehearses, and gets rejected by the same caps that guard its real orders.
 
 ## Tools
 
@@ -121,7 +155,7 @@ so the agent can correct itself instead of retrying blind.
   or an entry in that account's `extraAgents`). A wrong `--user` would otherwise leave the
   position and daily-loss caps reading an empty account.
 
-## Builder fee (what changes in week 2)
+## Builder fee
 
 Orders you approve will carry our builder code: `builder: {b: <address>, f: <fee in tenths
 of bp>}` — a 2–5 bp per-trade fee paid to the kit maintainer, capped at approval time and
@@ -133,8 +167,8 @@ revocable by you. Mechanics (verified from Hyperliquid docs, 2026-11-04):
 - Agent (API) wallets sign orders only — no withdrawals, no approvals.
 - Fee evidence is public: daily per-builder fill CSVs on Hyperliquid's stats host.
 
-Week 2 adds the local signer + builder-code attachment; week 3 ships example configs for
-common agent hosts.
+The local signer and builder-code attachment ship today (see "Placing real orders" below);
+example configs for common agent hosts are the next thing we add.
 
 ## License
 
@@ -170,15 +204,22 @@ and then only after every cap in your TOML passes.
 
 ## Placing real orders (`--live`)
 
-The dry-run simulator stays the default. Real orders need three things and nothing else:
+The dry-run simulator stays the default. Real orders need four things you control (plus one venue opt-in for mainnet):
 
+0. **`--live`** on the command line. Without it the process never reads a key and lists no
+   live tool at all.
 1. **Your own Hyperliquid API wallet key** in the environment as `HL_AGENT_KEY`. API wallets are
    sign-only: they can sign orders, never withdraw, never approve. The key is read from that
    variable only — never a flag, never a file, never `.env` — so it stays out of your shell
    history and the process list.
-2. **`--user`**, your MAIN wallet address: the account the orders trade for. The venue compares it
-   with the key, so a wrong pair fails on the first order instead of trading the wrong account.
+2. **`--user`**, your MAIN wallet address: the account the orders trade for. The signed action
+   carries no user field, so the venue cannot catch a wrong `--user`; the kit itself proves the
+   key may trade for that account (its address is `--user`, or an entry in that account's
+   `extraAgents`) and refuses to arm otherwise.
 3. **A guardrail config** (`--config`). The caps run *before* the signature exists.
+
+Mainnet on top of those four: `HL_ALLOW_MAINNET=1`. The default base URL IS mainnet, so without
+that variable the kit refuses to sign and exits. `--testnet` needs nothing extra.
 
 ```sh
 # testnet first, tiny size, throwaway key
