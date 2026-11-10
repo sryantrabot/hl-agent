@@ -8,7 +8,7 @@
 //!                     this flag the process holds no key and no signing code runs at all.
 //!   --user <0x...>    the account the orders trade for (your MAIN wallet address); required by --live
 //!   --builder <0x...> builder address to attach after YOUR approval (default: the kit maintainer's)
-//!   --fee-tenths-bp N our builder fee, 1..=100 tenths of a bp (default 10 = 1 bp)
+//!   --fee-tenths-bp N our builder fee, 1..=100 tenths of a bp (default 20 = 2 bp)
 //! The agent key is NEVER a flag: --live reads it from the HL_AGENT_KEY environment variable only,
 //! so it cannot land in argv, shell history or a process list.
 use hl_agent::guardrail::Guardrail;
@@ -76,9 +76,15 @@ fn main() {
     };
 
     if check_only {
-        println!("hl-agent: guardrail config OK (caps: pos={:.2}usd order={:.2}usd lev={}x loss={:.2}usd tripwire={}/{}s rate={}/h)",
-            cfg.max_position_notional_usd, cfg.max_order_notional_usd, cfg.max_leverage,
-            cfg.daily_loss_cap_usd, cfg.max_similar_actions, cfg.loop_window_seconds, cfg.max_calls_per_hour);
+        // Never let a stranger read built-in defaults as their own caps. The release notes
+        // tell people to smoke-test with `--check-config`; with no file that command used to
+        // print "guardrail config OK (caps: pos=1000 ...)" and nothing said the numbers came
+        // from the binary, not from a guardrail.toml they wrote.
+        if config.is_some() {
+            println!("{}", check_config_report(Some(&cfg)));
+        } else {
+            println!("{}", check_config_report(None));
+        }
         return;
     }
 
@@ -197,6 +203,47 @@ fn die(msg: &str) -> ! {
 
 /// Conservative built-in defaults when no --config is passed (simulate_order still
 /// disabled without --config; these only matter if a future flag enables it).
+/// The `--check-config` line. Says whose caps are being reported, so the built-in
+/// defaults can never be mistaken for a guardrail file the user wrote. PURE.
+fn check_config_report(cfg: Option<&hl_agent::guardrail::GuardrailConfig>) -> String {
+    let caps = |c: &hl_agent::guardrail::GuardrailConfig| format!(
+        "pos={:.2}usd order={:.2}usd lev={}x loss={:.2}usd tripwire={}/{}s rate={}/h",
+        c.max_position_notional_usd, c.max_order_notional_usd, c.max_leverage,
+        c.daily_loss_cap_usd, c.max_similar_actions, c.loop_window_seconds, c.max_calls_per_hour);
+    match cfg {
+        Some(c) => format!("hl-agent: guardrail config OK (caps: {})", caps(c)),
+        None => format!(
+            "hl-agent: no --config given, so there is no guardrail file to check. These are the BUILT-IN defaults, not caps you wrote: {}. Pass --config <guardrail.toml> (examples/guardrail.example.toml is a starting point) and --live will refuse to run without one.",
+            caps(&hl_agent::guardrail::GuardrailConfig::from_toml_str(defaults_toml()).expect("built-in defaults parse"))),
+    }
+}
+
 fn defaults_toml() -> &'static str {
     "max_position_notional_usd = 1000.0\nmax_order_notional_usd = 100.0\nmax_leverage = 1.0\naccount_equity_usd = 500.0\ndaily_loss_cap_usd = 20.0\nmax_similar_actions = 3\nloop_window_seconds = 60\nmax_calls_per_hour = 10\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--check-config` with no `--config` must not print the built-in default caps as if
+    /// they were the user's guardrail file. The release notes tell a stranger to smoke
+    /// test with this command; before this, it printed "guardrail config OK (caps: ...)"
+    /// over defaults from the binary and nothing said so.
+    #[test]
+    fn check_config_without_a_file_never_presents_defaults_as_the_users_caps() {
+        let out = check_config_report(None);
+        assert!(out.contains("BUILT-IN"), "must name them built-in defaults: {out}");
+        assert!(out.contains("no --config given"), "must say no file was given: {out}");
+        assert!(!out.contains("config OK"), "must not read as a passed check: {out}");
+
+        let cfg = hl_agent::guardrail::GuardrailConfig::from_toml_str(
+            "max_position_notional_usd = 42.0\nmax_order_notional_usd = 10.0\nmax_leverage = 1.0\naccount_equity_usd = 100.0\ndaily_loss_cap_usd = 5.0\nmax_similar_actions = 3\nloop_window_seconds = 60\nmax_calls_per_hour = 10\n",
+        )
+        .expect("valid toml");
+        let with_file = check_config_report(Some(&cfg));
+        assert!(with_file.contains("config OK"), "a real file still reports OK: {with_file}");
+        assert!(!with_file.contains("BUILT-IN"), "a real file is not built-in: {with_file}");
+        assert!(with_file.contains("pos=42.00usd"), "quotes the user's own number: {with_file}");
+    }
 }

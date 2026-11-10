@@ -328,6 +328,9 @@ impl<V: Venue> LiveTrader<V> {
             if self.cfg.fee_tenths_bp == 0 || self.cfg.fee_tenths_bp > 100 {
                 bail!("builder fee {} is outside 1..=100 tenths of a bp", self.cfg.fee_tenths_bp);
             }
+            // A typo here signs an order the venue rejects, and the user cannot tell why
+            // (critic round 5, non-blocking list). Refuse before signing, name the arg.
+            crate::signer::validate_builder_address(&addr)?;
             match self.venue.max_builder_fee(&self.cfg.user, &addr) {
                 Ok(approved) if approved >= self.cfg.fee_tenths_bp => {
                     builder = Some(HlBuilder { b: addr.to_ascii_lowercase(), f: self.cfg.fee_tenths_bp });
@@ -743,6 +746,31 @@ mod tests {
         let posts = t.venue.posts.borrow();
         assert_eq!(posts[0]["action"]["builder"]["b"], BUILDER);
         assert_eq!(posts[0]["action"]["builder"]["f"], 20);
+    }
+
+    /// A mixed-case builder address must be LOWERCASED before it enters the signed bytes.
+    /// The venue verifies the hash it builds from the action it receives, so a checksummed
+    /// (mixed-case) address there makes recovery yield a garbage signer and the order fails
+    /// with "User or API Wallet does not exist" (our own docs/errors/
+    /// user-or-api-wallet-does-not-exist.md, case 2; ccxt#30599, fixed in 4.5.82 by
+    /// lowercasing). src/live.rs lowercases it, but nothing pinned that, so a later edit
+    /// could silently kill the builder fee on every order.
+    #[test]
+    fn a_mixed_case_builder_address_is_lowercased_in_the_signed_action() {
+        let venue = FakeVenue::new(Some(2000.0), 25);
+        let mut c = cfg(true);
+        // The kit's real default builder from main.rs, which is mixed case.
+        c.builder = Some("0x5a229a20D9636a07583D6868FABf4B2903271Ab7".into());
+        let mut t = LiveTrader::new(venue, c, gate());
+        let out = t.place(&req(0.01), 1_730_000_000_000).unwrap();
+        match out {
+            LiveOutcome::Placed { builder_attached, .. } => assert!(builder_attached),
+            other => panic!("expected Placed, got {other:?}"),
+        }
+        let posts = t.venue.posts.borrow();
+        let b = posts[0]["action"]["builder"]["b"].as_str().unwrap();
+        assert_eq!(b, "0x5a229a20d9636a07583d6868fabf4b2903271ab7", "builder must be lowercase on the wire");
+        assert_eq!(b, b.to_ascii_lowercase(), "no uppercase byte may reach the signed action");
     }
 
     #[test]
